@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>OpenC6 BIOS Setup</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: 'Courier New', monospace; background: #0000AA; color: #CCCCCC; padding: 15px; text-transform: uppercase; }
+        .box { border: 2px solid #CCCCCC; padding: 20px; max-width: 800px; margin: auto; box-shadow: 10px 10px 0px #000; background: #0000AA; }
+        h1 { color: #FFFFFF; text-align: center; margin-bottom: 20px; background: #000000; padding: 10px; font-size: 1.5em; border: 2px solid #CCCCCC; }
+        h2 { color: #FFFF55; font-size: 1.2em; border-bottom: 2px dashed #CCCCCC; padding-bottom: 5px; margin-top: 30px;}
+        .row { display: flex; justify-content: space-between; margin: 10px 0; align-items: center; }
+        .row span { flex: 1; font-weight: bold; }
+        select, input { background: #CCCCCC; border: 2px solid #000000; font-family: 'Courier New', monospace; padding: 6px; flex: 1; max-width: 250px; color: #0000AA; font-weight: bold; text-transform: uppercase; }
+        input[type="range"] { cursor: pointer; -webkit-appearance: none; background: #555555; height: 12px; padding: 0; border: none; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 16px; height: 22px; background: #FFFF55; border: 2px solid #000; }
+        input:focus, select:focus { background: #FFFFFF; outline: none; border-color: #FFFF55; }
+
+        .btn-group { margin-top: 30px; border-top: 2px solid #CCCCCC; padding-top: 15px; text-align: center; }
+        button { cursor: pointer; padding: 10px 20px; margin: 5px; background: #CCCCCC; border: 2px solid #000000; color: #0000AA; font-family: 'Courier New', monospace; font-weight: bold; font-size: 1.1em; }
+        button:hover { background: #FFFFFF; color: #000000; border-color: #FFFF55; }
+        button:disabled { background: #555555; color: #AAAAAA; cursor: not-allowed; border-color: #555555; }
+
+        .footer { margin-top: 20px; font-size: 0.9em; color: #AAAAAA; text-align: center; border-top: 2px solid #555555; padding-top: 10px; font-weight: bold; }
+
+        /* Hardware Metrics & Statistics */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 0.9em; background: #000000; color: #CCCCCC; border: 2px solid #CCCCCC; }
+        th, td { border: 1px solid #555555; padding: 8px; text-align: left; }
+        th { color: #FFFF55; background: #000055; font-weight: bold; }
+
+        .storage-bar { width: 100%; background: #000000; height: 16px; margin-top: 10px; border: 2px solid #CCCCCC; position: relative; }
+        .storage-fill { background: #55FF55; height: 100%; transition: width 0.4s ease-in-out; }
+
+        .info-pane { background: #000000; padding: 15px; border: 2px solid #CCCCCC; margin-bottom: 10px; font-size: 1em; line-height: 1.6; }
+        .highlight { color: #55FF55; font-weight: bold; }
+        .me-badge { color: #FFFF55; font-weight: bold; }
+        .temp-warning { color: #FF5555; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>OPENC6 BIOS SETUP UTILITY</h1>
+
+        <div id="settings-form">
+            <!-- Real-time Hardware Monitor -->
+            <h2>System Health Monitor</h2>
+            <div class="info-pane" id="sys-info">
+                Detecting RISC-V Core & ULP...
+            </div>
+
+            <!-- Disk & Partitions -->
+            <h2>Storage & Partitions</h2>
+            <table>
+                <thead><tr><th>Label</th><th>Offset</th><th>Size</th></tr></thead>
+                <tbody id="partition-table"></tbody>
+            </table>
+
+            <!-- AI Tweaker Section -->
+            <h2>AI Tweaker (Performance)</h2>
+            <div class="row">
+                <span>CPU Clock Ratio:</span>
+                <select id="cpu_freq">
+                    <option value="80">80 MHz (Power Save)</option>
+                    <option value="120">120 MHz (Normal)</option>
+                    <option value="160">160 MHz (Turbo)</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>Power Governor:</span>
+                <select id="cpu_gov">
+                    <option value="0">Performance (Fixed)</option>
+                    <option value="1">SchedUtil (Dynamic)</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>Brownout Protection:</span>
+                <select id="bod_lvl">
+                    <option value="0">Strict (2.8V)</option>
+                    <option value="1">Relaxed (2.5V)</option>
+                    <option value="2">Disabled (Extreme)</option>
+                </select>
+            </div>
+
+            <!-- ME Thermal Threshold Controls -->
+            <div class="row">
+                <span>Thermal Throttle (&deg;C):</span>
+                <input type="number" id="temp_th" min="30" max="80" style="max-width: 80px;">
+            </div>
+            <div class="row">
+                <span>Thermal Emergency (&deg;C):</span>
+                <input type="number" id="temp_em" min="50" max="95" style="max-width: 80px;">
+            </div>
+
+            <!-- Main Config & ME -->
+            <h2>Main Configuration</h2>
+            <div class="row">
+                <span>Management Engine (ME):</span>
+                <select id="me_enable">
+                    <option value="1">Enabled (Active S5)</option>
+                    <option value="0">Disabled (Legacy)</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>DC Loss Action:</span>
+                <select id="dc_loss">
+                    <option value="0">Stay Off (S5)</option>
+                    <option value="1">Power On (S0)</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>POST LED Mode:</span>
+                <select id="post_led">
+                    <option value="0">Disabled</option>
+                    <option value="1">Enabled</option>
+                </select>
+            </div>
+
+            <!-- Network -->
+            <h2>Network Settings</h2>
+            <div class="row">
+                <span>SSID:</span>
+                <input type="text" id="wifi_ssid" maxlength="32">
+            </div>
+            <div class="row">
+                <span>Password:</span>
+                <input type="password" id="wifi_pass" maxlength="64">
+            </div>
+
+            <!-- PXE URL Target Configurator -->
+            <div class="row">
+                <span>PXE Server URL:</span>
+                <input type="text" id="pxe_url" maxlength="128" placeholder="http://192.168.1.172:8080/payload.bin">
+            </div>
+
+            <!-- Aura Sync -->
+            <h2>Aura Sync RGB</h2>
+            <div class="row">
+                <span>Lighting Mode:</span>
+                <select id="aura_mode">
+                    <option value="0">Static Blue</option>
+                    <option value="1">Rainbow Flow</option>
+                    <option value="2">Disabled</option>
+                </select>
+            </div>
+            <div class="row">
+                <span>Brightness:</span>
+                <input type="range" id="aura_brightness" min="0" max="255">
+            </div>
+        </div>
+
+        <!-- Exit Actions Control Group -->
+        <div class="btn-group">
+            <button onclick="saveAndReboot()">[ F10: Save & Exit ]</button>
+            <button onclick="loadDefaults()">[ F9: Load Defaults ]</button>
+            <button onclick="triggerNetworkOTA()">[ F12: Network BIOS Update ]</button>
+        </div>
+
+        <div class="footer">
+            Build: v1.3-THERMAL-ME | OpenC6 Project Firmware
+        </div>
+    </div>
+
+    <script>
+        async function refreshDynamicStats() {
+            try {
+                const res = await fetch('/api/sysinfo');
+                const hw = await res.json();
+
+                const nvs_total = hw.nvs_used_entries + hw.nvs_free_entries;
+                const nvs_percent = nvs_total > 0 ? Math.round((hw.nvs_used_entries / nvs_total) * 100) : 0;
+                const ram_used = hw.ram_total_kb - hw.ram_free_kb;
+
+                // Evaluate and display Management Engine active status
+                const meEnabled = document.getElementById('me_enable').value === "1";
+                const meStatusText = meEnabled ? "<span class='highlight'>ACTIVE (WDT & THERMAL GUARD)</span>" : "<span style='color:#FF5555'>OFFLINE</span>";
+
+                // Enforce red style warnings if junction temperature exceeds 75°C
+                const tempClass = hw.cpu_temp_c >= 75 ? "temp-warning" : "highlight";
+
+                document.getElementById('sys-info').innerHTML = `
+                    MAIN CORE: <span class="highlight">${hw.cpu_real_mhz} MHz</span> | TEMP: <span class="${tempClass}">${hw.cpu_temp_c}&deg;C</span><br>
+                    LP CORE (ME): ${meStatusText}<br>
+                    SYSTEM RAM: <span class="highlight">${ram_used} KB</span> / ${hw.ram_total_kb} KB IN USE<br>
+                    SPI FLASH: ${hw.flash_total_mb} MB ROM<br>
+                    NVRAM USAGE: ${hw.nvs_used_entries} / ${nvs_total} ENTRIES (${nvs_percent}%)
+                    <div class="storage-bar"><div class="storage-fill" style="width: ${nvs_percent}%;"></div></div>
+                `;
+
+                const table = document.getElementById('partition-table');
+                if (table.innerHTML === "") {
+                    let rows = "";
+                    hw.partitions.forEach(p => {
+                        rows += `<tr><td>${p.name}</td><td>0x${p.offset.toString(16).toUpperCase()}</td><td>${p.size_kb} KB</td></tr>`;
+                    });
+                    table.innerHTML = rows;
+                }
+            } catch (e) {
+                console.error("Stats update failed", e);
+            }
+        }
+
+        async function init() {
+            try {
+                const res = await fetch('/api/settings');
+                const cfg = await res.json();
+
+                // Populate form configurations
+                document.getElementById('dc_loss').value = cfg.dc_loss;
+                document.getElementById('post_led').value = cfg.post_led;
+                document.getElementById('wifi_ssid').value = cfg.wifi_ssid || "";
+                document.getElementById('wifi_pass').value = cfg.wifi_pass || "";
+                document.getElementById('pxe_url').value = cfg.pxe_url || "";
+                document.getElementById('aura_mode').value = cfg.aura_mode || 0;
+                document.getElementById('aura_brightness').value = cfg.aura_brightness || 128;
+                document.getElementById('cpu_freq').value = cfg.cpu_freq || 160;
+                document.getElementById('cpu_gov').value = cfg.cpu_gov || 0;
+                document.getElementById('bod_lvl').value = cfg.bod_lvl || 0;
+
+                // Populate safety thermal threshold metrics
+                document.getElementById('temp_th').value = cfg.temp_th !== undefined ? cfg.temp_th : 55;
+                document.getElementById('temp_em').value = cfg.temp_em !== undefined ? cfg.temp_em : 75;
+
+                // Fallback me_enable state configurations
+                document.getElementById('me_enable').value = cfg.me_enable !== undefined ? cfg.me_enable : 1;
+
+                refreshDynamicStats();
+                setInterval(refreshDynamicStats, 1000);
+
+            } catch (e) {
+                alert("BIOS COMMUNICATION ERROR!");
+            }
+        }
+
+        async function saveAndReboot() {
+            const data = {
+                dc_loss: parseInt(document.getElementById('dc_loss').value),
+                post_led: parseInt(document.getElementById('post_led').value),
+                wifi_ssid: document.getElementById('wifi_ssid').value,
+                wifi_pass: document.getElementById('wifi_pass').value,
+                pxe_url: document.getElementById('pxe_url').value,           // Transmit to ESP32 core
+                aura_mode: parseInt(document.getElementById('aura_mode').value),
+                aura_brightness: parseInt(document.getElementById('aura_brightness').value),
+                cpu_freq: parseInt(document.getElementById('cpu_freq').value),
+                cpu_gov: parseInt(document.getElementById('cpu_gov').value),
+                bod_lvl: parseInt(document.getElementById('bod_lvl').value),
+                me_enable: parseInt(document.getElementById('me_enable').value),
+
+                // Include safety thermal threshold metrics inside payload
+                temp_th: parseInt(document.getElementById('temp_th').value),
+                temp_em: parseInt(document.getElementById('temp_em').value)
+            };
+
+            const res = await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(data)
+            });
+
+            if (res.ok) {
+                alert("SYSTEM SETTINGS SAVED.\nREBOOTING...");
+                fetch('/api/reboot', { method: 'POST' });
+            }
+        }
+
+        async function loadDefaults() {
+            if(confirm("LOAD OPTIMIZED DEFAULTS?")) {
+                await fetch('/api/defaults', { method: 'POST' });
+                location.reload();
+            }
+        }
+
+        // Handle wireless BIOS firmware OTA update triggers
+        async function triggerNetworkOTA() {
+            const pxeUrl = document.getElementById('pxe_url').value;
+            if (!pxeUrl || pxeUrl.trim() === "") {
+                alert("PLEASE CONFIGURE 'PXE SERVER URL' FIRST!\nIT MUST POINT TO THE NEW esp32_c6_bios.bin FILE.");
+                return;
+            }
+
+            if (confirm("START NETWORK BIOS UPDATE?\n\nSystem will reboot, connect to your home Wi-Fi and flash the new BIOS binary from:\n" + pxeUrl + "\n\nDO NOT POWER OFF THE SYSTEM DURING THE PROCESS!")) {
+                const btn = document.querySelector("button[onclick='triggerNetworkOTA()']");
+                const originalText = btn.innerText;
+                btn.innerText = "REBOOTING INTO OTA FLASH MODE...";
+                btn.disabled = true;
+
+                try {
+                    const res = await fetch('/api/trigger_ota', { method: 'POST' });
+                    if (res.ok) {
+                        alert("BIOS NETWORK UPDATE INITIALIZED!\nRebooting now... Observe the Type-C serial console log.");
+                        location.reload();
+                    } else {
+                        alert("FAILED TO TRIGGER BIOS UPDATE!");
+                        btn.innerText = originalText;
+                        btn.disabled = false;
+                    }
+                } catch (e) {
+                    alert("COMMUNICATION ERROR!");
+                    btn.innerText = originalText;
+                    btn.disabled = false;
+                }
+            }
+        }
+
+        window.onload = init;
+    </script>
+</body>
+</html>
