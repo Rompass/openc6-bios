@@ -1,4 +1,4 @@
-# 🚀 OpenC6 BIOS: Advanced Modular Firmware for ESP32-C6
+# OpenC6 BIOS: Advanced Modular Firmware for ESP32-C6
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Hardware: ESP32-C6](https://img.shields.io/badge/Hardware-ESP32--C6-red.svg)](https://www.espressif.com/en/products/socs/esp32-c6)
@@ -10,7 +10,7 @@ Instead of monolithic firmwares, OpenC6 acts as a host platform. It initializes 
 
 ---
 
-## 🎨 Visual Demos
+##  Visual Demos
 
 ### 1. Retro Web Setup Utility (1280x1024 5:4 Native Look)
 Experience the nostalgic blue-screen interface of classic PC BIOS, fully running on the ESP32-C6-Zero and accessible via local Wi-Fi.
@@ -22,18 +22,18 @@ Real-time demonstration of the addressable POST LED smoothly cycling colors (Aur
 
 ---
 
-## ✨ Key Architectural Features
+## Key Architectural Features
 
-* 🛡️ **LP-Core Management Engine (ME):** An autonomous out-of-band RISC-V coprocessor that monitors system health, reads the power button, handles hardware Watchdogs, and triggers emergency thermal shutdowns even if the main OS crashes.
-* ⚡ **SchedUtil Dynamic Governor:** Real-time load-adaptive CPU frequency scaling (80/120/160 MHz) calculated via FreeRTOS idle cycles.
-* 🔌 **Network Boot (PXE):** Dynamically fetch and execute bare-metal payloads over Wi-Fi without wearing out the flash memory using physical USB tools.
-* 🧱 **Anti-Brick A/B OTA:** Network updates for the BIOS itself are protected by hardware rollback mechanisms.
-* 🛠️ **Retro Web Setup Utility:** An integrated AP-mode web server with a classic blue-screen BIOS interface for AI Tweaker configurations (Overclocking, BOD levels, Thermal limits).
-* 📜 **Standardized ABI:** Payloads compile without ESP-IDF (`-nostdlib -fPIC`), weighing only 2-10 KB, while utilizing BIOS-provided Wi-Fi, Math, and Crypto engines.
+*  **LP-Core Management Engine (ME):** An autonomous out-of-band RISC-V coprocessor that monitors system health, reads the power button, handles hardware Watchdogs, and triggers emergency thermal shutdowns even if the main OS crashes.
+*  **SchedUtil Dynamic Governor:** Real-time load-adaptive CPU frequency scaling (80/120/160 MHz) calculated via FreeRTOS idle cycles.
+*  **Network Boot (PXE):** Dynamically fetch and execute bare-metal payloads over Wi-Fi without wearing out the flash memory using physical USB tools.
+*  **Anti-Brick A/B OTA:** Network updates for the BIOS itself are protected by hardware rollback mechanisms.
+*  **Retro Web Setup Utility:** An integrated AP-mode web server with a classic blue-screen BIOS interface for AI Tweaker configurations (Overclocking, BOD levels, Thermal limits).
+*  **Standardized ABI:** Payloads compile without ESP-IDF (`-nostdlib -fPIC`), weighing only 2-10 KB, while utilizing BIOS-provided Wi-Fi, Math, and Crypto engines.
 
 ---
 
-## 📚 Comprehensive Documentation
+##  Comprehensive Documentation
 
 The architecture of OpenC6 is heavily documented. Please refer to the `docs/` directory for deep technical dives into each subsystem:
 
@@ -50,7 +50,7 @@ The architecture of OpenC6 is heavily documented. Please refer to the `docs/` di
 
 ---
 
-## 🔌 Hardware Pinout (ESP32-C6-Zero / Generic C6)
+##  Hardware Pinout (ESP32-C6-Zero / Generic C6)
 
 | Component          | GPIO Pin                            | Description                                                        |
 | :----------------- | :---------------------------------: | :----------------------------------------------------------------- |
@@ -63,7 +63,7 @@ The architecture of OpenC6 is heavily documented. Please refer to the `docs/` di
 
 ---
 
-## 🚀 Quick Start Guide
+##  Quick Start Guide
 
 ### 1. Build and Flash the BIOS
 Ensure you have the ESP-IDF (v6.1-dev) installed and sourced.
@@ -84,7 +84,7 @@ make
 See payload_development_serial_boot.md for instructions on deploying via the
 UART Serial Loader.
 
-🌐 Network Booting & OTA Updates
+ Network Booting & OTA Updates
 
 OpenC6 allows you to download Payloads or update the BIOS entirely over your
 home Wi-Fi using a simple local Python web server.
@@ -133,7 +133,7 @@ Anti-Brick Safety: If the new BIOS crashes, the LP-Core Watchdog will trigger a
 hardware reset, and the ESP32 bootloader will automatically roll back to the
 previous stable version!
 
-🛤️ Roadmap & Known Issues (Help Wanted!)
+ Roadmap & Known Issues (Help Wanted!)
 
 This project is actively evolving. Pull requests are highly welcome for the
 following:
@@ -149,7 +149,7 @@ following:
   - 🟢 Watchdog Delegation: Exposing the pet_watchdog() function to the ABI so
     payloads can be monitored for thread-locks.
 
-📄 License
+ License
 
 This project is licensed under the MIT License. See the LICENSE file for
 details. Let's change the embedded development paradigm together!
