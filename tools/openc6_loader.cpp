@@ -126,9 +126,8 @@ int main(int argc, char* argv[]) {
 
         std::cout << "BIOS is ready! Sending file size with Magic Preambule...\n";
 
-        // 2. ВІДПРАВЛЯЄМО 6 БАЙТІВ (2 БАЙТИ ПРЕАМБУЛИ 0x5A 0xA5 + 4 БАЙТИ РОЗМІРУ)
         uint8_t size_buf[6] = {
-            0x5A, 0xA5, // <--- БРОНЕБІЙНА ПРЕАМБУЛА
+            0x5A, 0xA5,
             (uint8_t)(file_size & 0xFF),
             (uint8_t)((file_size >> 8) & 0xFF),
             (uint8_t)((file_size >> 16) & 0xFF),
@@ -136,7 +135,6 @@ int main(int argc, char* argv[]) {
         };
         serial.write_data(size_buf, 6);
 
-        // 🔴 КРИТИЧНЕ ОНОВЛЕННЯ: Чекаємо на ACK до 10 секунд, бо очищення Flash займає час!
         std::cout << "Waiting for BIOS to allocate RAM or Erase Flash...\n";
         auto erase_wait_start = std::chrono::steady_clock::now();
         bool ack_received = false;
@@ -161,7 +159,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // 3. ПЕРЕДАЧА ДАНИХ (Чанками по 64 байти)
         std::cout << "Flashing Payload...\n";
         size_t total_sent = 0;
 
@@ -170,7 +167,6 @@ int main(int argc, char* argv[]) {
 
             serial.write_data(payload.data() + total_sent, chunk);
 
-            // Чекаємо ACK
             if (!serial.read_byte(rx_byte) || rx_byte != CMD_ACK) {
                 std::cerr << "\nERROR: Failed waiting for ACK at offset " << total_sent << "!\n";
                 return 1;
