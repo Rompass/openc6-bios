@@ -2,11 +2,39 @@
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_partition.h"
-#include "esp_ota_ops.h" // Added hardware OTA update driver support
+#include "esp_ota_ops.h"
+#include <string.h>
+#include <stdlib.h>
+
+#include "openc6_fs.h"
+#include "hal_flash.h"
 
 static const char *TAG = "PXE_BOOT";
 
-// ─── 1. USER PAYLOAD NETWORK DEPLOYMENT (XIP TARGET) ─────────────────────────
+// Helper to extract filename from URL (e.g. "http://host/app.bin" -> "app.bin")
+static const char *get_filename_from_url(const char *url) {
+    const char *filename = strrchr(url, '/');
+    if (filename) {
+        return filename + 1;
+    }
+    return "payload.bin"; // fallback name
+}
+
+static uint16_t get_or_create_dir(const char *dir_name) {
+    int16_t id = fs_find_id(dir_name, 0);
+    if (id >= 0) {
+        return (uint16_t)id;
+    }
+
+    id = fs_mkdir(dir_name, 0);
+    if (id >= 0) {
+        return (uint16_t)id;
+    }
+
+    return 0;
+}
+
+// ─── 1. USER PAYLOAD NETWORK DEPLOYMENT TO /downloaded/ FOLDER (RAM Staging) ───
 
 bool pxe_boot_execute(const char* url) {
     ESP_LOGI(TAG, "Starting Network Boot from: %s", url);
@@ -37,21 +65,24 @@ bool pxe_boot_execute(const char* url) {
         return false;
     }
 
-    ESP_LOGI(TAG, "Found payload. Size: %d bytes. Preparing Flash...", content_length);
-
-    const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0xff, "network_buf");
-    if (!part || content_length > part->size) {
-        ESP_LOGE(TAG, "Flash partition 'network_buf' not found or too small");
+    // Limit maximum payload download size to protect SRAM boundaries (e.g. max 150 KB)
+    if (content_length > 150 * 1024) {
+        ESP_LOGE(TAG, "Payload size %d exceeds safe RAM limits (150KB)!", content_length);
         esp_http_client_cleanup(client);
         return false;
     }
 
-    // Erase the required flash range (size must be aligned to a 4KB sector boundary)
-    uint32_t erase_size = (content_length + 4095) & ~4095;
-    esp_partition_erase_range(part, 0, erase_size);
-    ESP_LOGI(TAG, "Flash erased. Downloading payload...");
+    ESP_LOGI(TAG, "Found payload. Size: %d bytes. Allocating RAM buffer...", content_length);
 
-    // Fetch and commit payload stream in 1024-byte chunks
+    uint8_t *h_buf = malloc(content_length);
+    if (!h_buf) {
+        ESP_LOGE(TAG, "Failed to allocate memory buffer of %d bytes", content_length);
+        esp_http_client_cleanup(client);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Downloading payload stream...");
+
     int total_read = 0;
     char buffer[1024];
 
@@ -59,34 +90,47 @@ bool pxe_boot_execute(const char* url) {
         int read_len = esp_http_client_read(client, buffer, sizeof(buffer));
         if (read_len < 0) {
             ESP_LOGE(TAG, "Error reading data or connection closed prematurely");
+            free(h_buf);
             esp_http_client_cleanup(client);
             return false;
         }
         if (read_len == 0) {
-            break; // End of file stream reached
+            break;
         }
 
-        esp_partition_write(part, total_read, buffer, read_len);
+        memcpy(h_buf + total_read, buffer, read_len);
         total_read += read_len;
 
-        // Print progress telemetry every ~10 KB of data transfer
         if (total_read % (1024 * 10) == 0) {
-            ESP_LOGI(TAG, "Progress: %d / %d bytes", total_read, content_length);
+            ESP_LOGI(TAG, "Download Progress: %d / %d bytes", total_read, content_length);
         }
     }
 
     esp_http_client_cleanup(client);
 
     if (total_read == content_length) {
-        ESP_LOGI(TAG, "PXE Download 100%% complete! (%d bytes written to Flash)", total_read);
+        uint16_t target_dir_id = get_or_create_dir("downloaded");
+        const char *filename = get_filename_from_url(url);
+
+        ESP_LOGI(TAG, "Saving file '%s' into '/downloaded/' folder (Dir ID: %d)...", filename, target_dir_id);
+
+        if (fs_write_file(filename, h_buf, total_read, target_dir_id) < 0) {
+            ESP_LOGE(TAG, "Failed to save file onto LFS partition! Disk may be full.");
+            free(h_buf);
+            return false;
+        }
+
+        free(h_buf);
+        ESP_LOGI(TAG, "PXE Download 100%% complete!");
         return true;
     } else {
         ESP_LOGE(TAG, "Download incomplete! Got %d out of %d", total_read, content_length);
+        free(h_buf);
         return false;
     }
 }
 
-// ─── 2. WIRELESS SYSTEM FIRMWARE SELF-UPDATE (BIOS OTA) ──────────────────────
+// ─── 2. WIRELESS SYSTEM FIRMWARE SELF-UPDATE (Direct Hardware Streaming) ────
 
 bool pxe_bios_ota_execute(const char* url) {
     ESP_LOGW(TAG, "Starting Network BIOS OTA from: %s", url);
@@ -117,7 +161,6 @@ bool pxe_bios_ota_execute(const char* url) {
         return false;
     }
 
-    // Automatically locate the passive/inactive system boot OTA partition slot
     const esp_partition_t *update_part = esp_ota_get_next_update_partition(NULL);
     if (update_part == NULL) {
         ESP_LOGE(TAG, "Passive OTA partition not found!");
@@ -136,7 +179,7 @@ bool pxe_bios_ota_execute(const char* url) {
         return false;
     }
 
-    // Fetch and write firmware data in 1024-byte block sequences
+    // Stream and flash the partition in 1024-byte chunks (Consumes only 1 KB of RAM!)
     char buffer[1024];
     int total_read = 0;
 
@@ -149,7 +192,7 @@ bool pxe_bios_ota_execute(const char* url) {
             return false;
         }
         if (read_len == 0) {
-            break; // End of file stream reached
+            break;
         }
 
         err = esp_ota_write(update_handle, buffer, read_len);
@@ -162,7 +205,6 @@ bool pxe_bios_ota_execute(const char* url) {
 
         total_read += read_len;
 
-        // Print progress telemetry every ~50 KB to avoid flooding slow UART terminals
         if (total_read % (1024 * 50) == 0) {
             ESP_LOGI(TAG, "OTA Progress: %d / %d bytes", total_read, content_length);
         }
@@ -177,7 +219,6 @@ bool pxe_bios_ota_execute(const char* url) {
             return false;
         }
 
-        // Re-target the second-stage bootloader vector flags to run from the newly written partition
         err = esp_ota_set_boot_partition(update_part);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(err));

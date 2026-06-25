@@ -31,3 +31,4 @@ boot_option_t boot_manager_interactive_menu(void);
  * @return true if the payload has been successfully parsed, validated, and mapped.
  */
 bool boot_manager_serial_listen(int timeout_sec, payload_target_t target);
+void boot_manager_shell(void);

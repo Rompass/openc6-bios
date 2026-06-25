@@ -26,6 +26,10 @@
 #include "openc6_abi.h"
 #include "pxe_boot.h"
 
+// File system components inclusion
+#include "openc6_fs.h"
+#include "hal_flash.h"
+
 #define BIOS_AP_SSID "BIOS_SETUP_C6"
 
 // GPIO pins for power button (Software GND and Sense)
@@ -37,7 +41,6 @@ static const char *TAG = "BIOS_CORE";
 
 bool is_me_enabled = true;
 
-// 1. UPDATE: Add ABI wrappers to allow payloads from Flash/RAM to yield CPU and allocate heap
 static void bios_delay_ms(uint32_t ms) {
     vTaskDelay(pdMS_TO_TICKS(ms));
 }
@@ -48,27 +51,19 @@ static void* bios_malloc(uint32_t size) {
 
 // ─── CONSOLE OUTPUT WRAPPER (PRINT) ──────────────────────────────────────────────
 
-// Send text output directly to the active BIOS console for debugging inside payloads
 static void bios_print(const char *str) {
     printf("%s", str);
 }
 
 static void bios_sha256(const uint8_t *input, uint32_t len, uint8_t *output) {
-    // Initialize crypto subsystem (if already initialized, it will return success safely)
     psa_crypto_init();
-
     size_t hash_len;
-    // Compute hash using the universal API
-    psa_hash_compute(PSA_ALG_SHA_256,
-                     input, len,
-                     output, 32,
-                     &hash_len);
+    psa_hash_compute(PSA_ALG_SHA_256, input, len, output, 32, &hash_len);
 }
 
 // ─── WI-FI ABI WRAPPERS ──────────────────────────────────────────────────
 
 static int32_t bios_wifi_connect(const char* ssid, const char* pass) {
-    // Override Wi-Fi credentials in NVRAM and initiate connection
     nvram_set_wifi_sta_config(ssid, pass);
     return (wifi_mgmt_start_sta() == ESP_OK) ? 0 : -1;
 }
@@ -99,9 +94,8 @@ static uint32_t bios_get_total_flash(void) {
     return 0;
 }
 
-// ─── MATHEMATICAL COMPATIBILITY ABI WRAPPERS (FPU-LESS PAYLOAD SUPPORT) ────────────────────────
+// ─── MATHEMATICAL COMPATIBILITY ABI WRAPPERS ────────────────────────
 
-// Fast integer square root (avoiding heavy floating-point calculation)
 static uint32_t bios_math_isqrt(uint32_t x) {
     uint32_t res = 0;
     uint32_t bit = 1UL << 30;
@@ -118,16 +112,33 @@ static uint32_t bios_math_isqrt(uint32_t x) {
     return res;
 }
 
-// Calculate sine inside BIOS and return fixed-point result scaled by 10000
 static int32_t bios_math_sin_deg(int32_t deg) {
     double rad = deg * (3.14159265359 / 180.0);
     return (int32_t)(sin(rad) * 10000.0);
 }
 
-// Same fixed-point scaling for cosine calculation inside BIOS
 static int32_t bios_math_cos_deg(int32_t deg) {
     double rad = deg * (3.14159265359 / 180.0);
     return (int32_t)(cos(rad) * 10000.0);
+}
+
+// ─── FILE SYSTEM ABI WRAPPERS ──────────────────────────────────────────────────
+
+static void abi_fs_write_file(const char *name, const uint8_t *data, uint32_t len, uint32_t parent_id, uint8_t force) {
+    fs_write_file(name, data, len, (uint16_t)parent_id);
+}
+
+static int32_t abi_fs_read_file(const char *name, uint8_t *dest, uint32_t offset, uint32_t len, uint32_t parent_id) {
+    int16_t id = fs_find_id(name, (uint16_t)parent_id);
+    if (id < 0) return -1;
+    return fs_read_file((uint16_t)id, dest, offset, len);
+}
+
+static void abi_fs_delete(const char *name, uint32_t parent_id) {
+    int16_t id = fs_find_id(name, (uint16_t)parent_id);
+    if (id >= 0) {
+        fs_delete((uint16_t)id);
+    }
 }
 
 static const openc6_abi_t bios_abi = {
@@ -155,7 +166,12 @@ static const openc6_abi_t bios_abi = {
     // System telemetry and RAM sizing
     .get_free_ram = bios_get_free_ram,
     .get_total_ram = bios_get_total_ram,
-    .get_total_flash = bios_get_total_flash
+    .get_total_flash = bios_get_total_flash,
+
+    // File System ABI exports
+    .fs_write_file = abi_fs_write_file,
+    .fs_read_file = abi_fs_read_file,
+    .fs_delete = abi_fs_delete
 };
 
 // ─── LP Core Software Watchdog feeder ────────────────────────────────────────
@@ -199,7 +215,6 @@ void bios_enter_s5_state(void)
 
 void bios_core_start(void)
 {
-    // --- 0. LEGACY WAKEUP MEASUREMENT (EXECUTE BEFORE ANY CONTEXT DELAYS!) ---
     esp_reset_reason_t rst_reason = esp_reset_reason();
     bool is_cold_boot = (rst_reason != ESP_RST_DEEPSLEEP);
     uint32_t legacy_hold_ms = 0;
@@ -222,8 +237,7 @@ void bios_core_start(void)
 
     gpio_hold_dis((gpio_num_t)PIN_BTN_GND);
 
-    // --- MAIN BOOT INITIATION ---
-    vTaskDelay(pdMS_TO_TICKS(4500)); // Workaround delay for USB Type-C interface reconnection
+    vTaskDelay(pdMS_TO_TICKS(4500));
     ESP_LOGI(TAG, "--- OpenC6 BIOS v1.1-ME Initializing ---");
     ESP_LOGI(TAG, "Reset reason: %d, cold_boot: %s", rst_reason, is_cold_boot ? "YES" : "NO");
 
@@ -234,6 +248,9 @@ void bios_core_start(void)
     nvram_init();
     led_mgmt_init();
     wifi_mgmt_init();
+
+    hal_flash_init();
+    fs_init();
 
     gpio_reset_pin((gpio_num_t)PIN_BTN_BOOT);
     gpio_set_direction((gpio_num_t)PIN_BTN_BOOT, GPIO_MODE_INPUT);
@@ -260,11 +277,10 @@ void bios_core_start(void)
     if (ota_state == BIOS_UPDATE_PENDING) {
         ESP_LOGW(TAG, ">>> NETWORK BIOS UPDATE PENDING <<<");
 
-        // Reset update pending flag in NVRAM immediately to prevent boot loops if network is lost
         nvram_set_bios_update_state(BIOS_UPDATE_NONE);
 
         led_mgmt_set_aura_mode(AURA_DISABLED);
-        led_mgmt_set_color(0, 0, 255); // Blue illumination indicating firmware flash mode
+        led_mgmt_set_color(0, 0, 255);
 
         if (wifi_mgmt_start_sta() == ESP_OK) {
             char pxe_url[PXE_URL_MAX_LEN + 1] = {0};
@@ -272,23 +288,22 @@ void bios_core_start(void)
 
             if (pxe_bios_ota_execute(pxe_url)) {
                 ESP_LOGI(TAG, "Update Complete! Rebooting into NEW BIOS...");
-                led_mgmt_set_color(0, 255, 0); // Green
+                led_mgmt_set_color(0, 255, 0);
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 esp_restart();
             } else {
                 ESP_LOGE(TAG, "Update Failed! Continuing normal boot...");
-                led_mgmt_set_color(255, 0, 0); // Red
+                led_mgmt_set_color(255, 0, 0);
                 vTaskDelay(pdMS_TO_TICKS(2000));
             }
         } else {
             ESP_LOGE(TAG, "WiFi connection failed. Cannot update BIOS. Continuing normal boot...");
-            led_mgmt_set_color(255, 0, 0); // Red
+            led_mgmt_set_color(255, 0, 0);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
     }
     // =========================================================================
 
-    // --- Clear CMOS Jumper State Verification ---
     gpio_reset_pin((gpio_num_t)PIN_CMOS_GND);
     gpio_set_direction((gpio_num_t)PIN_CMOS_GND, GPIO_MODE_OUTPUT);
     gpio_set_level((gpio_num_t)PIN_CMOS_GND, 0);
@@ -366,15 +381,15 @@ void bios_core_start(void)
     }
     else if (me_reason == ME_BOOT_REASON_WDT) {
         ESP_LOGE(TAG, "ME Watchdog Reset! HP Core was unresponsive. Recovery boot...");
-        direct_flash_boot = true; // Attempt safe execution restore from system Flash
+        direct_flash_boot = true;
     }
     else if (me_reason == ME_BOOT_REASON_SETUP || legacy_hold_ms >= 3000) {
         ESP_LOGI(TAG, "Wakeup: BIOS Setup requested.");
         enter_setup = true;
     }
     else if (me_reason == ME_BOOT_REASON_NORMAL || legacy_hold_ms > 0) {
-        ESP_LOGI(TAG, "Wakeup: Normal Boot requested. Checking Flash...");
-        direct_flash_boot = true; // <--- PRIORITY PATH: Evaluate Flash stability first!
+        ESP_LOGI(TAG, "Wakeup: Normal Boot requested. Checking File System...");
+        direct_flash_boot = true;
     }
     else if (is_cold_boot) {
         dc_loss_action_t dc_action;
@@ -383,8 +398,8 @@ void bios_core_start(void)
             ESP_LOGI(TAG, "DC Loss Action: POWER_OFF. Going to S5.");
             bios_enter_s5_state();
         } else {
-            ESP_LOGI(TAG, "DC Loss Action: BOOT. Starting normally. Checking Flash...");
-            direct_flash_boot = true; // <--- PRIORITY PATH: Evaluate Flash stability first!
+            ESP_LOGI(TAG, "DC Loss Action: BOOT. Starting normally. Checking File System...");
+            direct_flash_boot = true;
         }
     }
 
@@ -397,10 +412,10 @@ void bios_core_start(void)
 
     // A) SERIAL BOOT TO VOLATILE SRAM
     if (serial_boot_ram) {
-        serial_boot_ram = false; // Reset option flag
+        serial_boot_ram = false;
         ESP_LOGW(TAG, ">>> ENTERING SERIAL BOOT MODE (RAM target) <<<");
         led_mgmt_set_aura_mode(AURA_DISABLED);
-        led_mgmt_set_color(255, 0, 255); // Magenta
+        led_mgmt_set_color(255, 0, 255);
 
         if (!boot_manager_serial_listen(30, PAYLOAD_TARGET_RAM)) {
             ESP_LOGE(TAG, "Serial RAM Boot failed/timeout! Falling back to Setup...");
@@ -409,18 +424,11 @@ void bios_core_start(void)
         }
     }
 
-    // B) SERIAL BOOT TO NON-VOLATILE FLASH
+    // B) SERIAL BOOT TO NON-VOLATILE FLASH(UNIX SHELL)
     if (serial_boot_flash) {
         serial_boot_flash = false;
-        ESP_LOGW(TAG, ">>> ENTERING SERIAL BOOT MODE (FLASH target) <<<");
-        led_mgmt_set_aura_mode(AURA_DISABLED);
-        led_mgmt_set_color(255, 105, 180); // Pink
-
-        if (!boot_manager_serial_listen(30, PAYLOAD_TARGET_FLASH)) {
-            ESP_LOGE(TAG, "Serial Flash Boot failed/timeout! Falling back to Setup...");
-            enter_setup = true;
-            goto execute_boot;
-        }
+        boot_manager_shell();
+        goto execute_boot;
     }
 
     // C) PXE WIRELESS NETWORK BOOT
@@ -433,12 +441,10 @@ void bios_core_start(void)
         if (wifi_mgmt_start_sta() == ESP_OK) {
             ESP_LOGI(TAG, "Network Ready. Handing over to Boot Manager (PXE)...");
 
-            // No more hardcoded parameters: Dynamically query PXE target URL from NVRAM
             char pxe_url[PXE_URL_MAX_LEN + 1] = {0};
             nvram_get_pxe_url(pxe_url, sizeof(pxe_url));
 
             if (pxe_boot_execute(pxe_url)) {
-                // SUCCESS: Route bootflow to Flash Execute-In-Place
                 ESP_LOGI(TAG, "PXE Success! Redirecting to Flash Boot...");
                 direct_flash_boot = true;
                 goto execute_boot;
@@ -454,49 +460,106 @@ void bios_core_start(void)
         }
     }
 
-    // D) EXECUTE-IN-PLACE (XIP) STABLE LOCAL BOOT
+    // D) EXECUTE-IN-PLACE (XIP) STABLE LOCAL BOOT FROM FILE SYSTEM (downloaded/payload.bin)
     if (direct_flash_boot) {
         direct_flash_boot = false;
-        ESP_LOGI(TAG, "Checking for Stored OS in Flash...");
+        ESP_LOGI(TAG, "Checking for Stored OS (payload.bin) in OpenC6 File System...");
 
-        const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0xff, "network_buf");
+        const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0xff, "openc6_fs");
         if (part) {
-            uint32_t first_word = 0;
-            // Read first 4 bytes to check if Flash space is blank (0xFF)
-            esp_partition_read(part, 0, &first_word, sizeof(first_word));
+            uint16_t boot_dir_id = 0;
 
-            if (first_word != 0xFFFFFFFF) {
-                // Segment verified. Booting Payload!
-                ESP_LOGW(TAG, ">>> LAUNCHING STORED OS FROM FLASH <<<");
-                led_mgmt_set_aura_mode(AURA_DISABLED);
-                led_mgmt_set_color(0, 255, 0); // Green
+            int16_t dir_id = fs_find_id("downloaded", 0);
+            if (dir_id >= 0 && fs_get_type(dir_id) == TYPE_DIR) {
+                boot_dir_id = (uint16_t)dir_id;
+            }
 
-                const void *payload_mapped_ptr = NULL;
-                esp_partition_mmap_handle_t mmap_handle;
+            int16_t file_id = fs_find_id("payload.bin", boot_dir_id);
+            if (file_id >= 0 && fs_get_type(file_id) == TYPE_FILE) {
+                int32_t file_size = fs_get_size(file_id);
+                if (file_size > 0) {
+                    led_mgmt_set_aura_mode(AURA_DISABLED);
+                    led_mgmt_set_color(0, 255, 0);
 
-                esp_err_t err = esp_partition_mmap(part, 0, part->size, ESP_PARTITION_MMAP_INST, &payload_mapped_ptr, &mmap_handle);
-                if (err == ESP_OK && payload_mapped_ptr != NULL) {
-                    ESP_LOGI(TAG, "XIP mapped at Virtual Address: %p. Jumping...", payload_mapped_ptr);
-                    vTaskDelay(pdMS_TO_TICKS(100)); // Allow UART flush to finish
+                    void *payload_ram_ptr = heap_caps_malloc(file_size, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL);
+                    if (payload_ram_ptr != NULL) {
+                        ESP_LOGW(TAG, ">>> LAUNCHING STORED OS (payload.bin) FROM FS TO RAM <<<");
+                        int32_t r_bytes = fs_read_file(file_id, payload_ram_ptr, 0, file_size);
+                        if (r_bytes == file_size) {
+                            ESP_LOGI(TAG, "Payload loaded to RAM at %p. Jumping...", payload_ram_ptr);
+                            vTaskDelay(pdMS_TO_TICKS(100));
 
-                    typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
-                    payload_entry_t launch_payload = (payload_entry_t)payload_mapped_ptr;
+                            typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
+                            payload_entry_t launch_payload = (payload_entry_t)payload_ram_ptr;
 
-                    asm volatile ("fence.i");          // Clear CPU pipeline barrier
-                    launch_payload(&bios_abi);         // Handover system ABI and branch execution
+                            asm volatile ("fence.i");
+                            launch_payload(&bios_abi);
+                        } else {
+                            ESP_LOGE(TAG, "Failed to read payload from FS!");
+                            free(payload_ram_ptr);
+                            enter_setup = true;
+                            goto execute_boot;
+                        }
+                    } else {
+                        ESP_LOGW(TAG, ">>> RAM FULL. LAUNCHING STORED OS VIA XIP FALLBACK <<<");
+                        const esp_partition_t *xip_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x20, "payload_xip");
+                        if (xip_part && file_size <= xip_part->size) {
+                            ESP_LOGI(TAG, "Deploying %ld bytes to XIP partition...", file_size);
+                            esp_partition_erase_range(xip_part, 0, (file_size + 4095) & ~4095);
+
+                            uint8_t buf[1024];
+                            uint32_t offset = 0;
+                            bool copy_ok = true;
+                            while (offset < file_size) {
+                                uint32_t chunk = (file_size - offset > sizeof(buf)) ? sizeof(buf) : (file_size - offset);
+                                if (fs_read_file(file_id, buf, offset, chunk) != chunk) {
+                                    copy_ok = false;
+                                    break;
+                                }
+                                esp_partition_write(xip_part, offset, buf, chunk);
+                                offset += chunk;
+                            }
+
+                            if (copy_ok) {
+                                const void *mapped_ptr = NULL;
+                                esp_partition_mmap_handle_t mmap_handle;
+                                if (esp_partition_mmap(xip_part, 0, file_size, ESP_PARTITION_MMAP_INST, &mapped_ptr, &mmap_handle) == ESP_OK) {
+                                    ESP_LOGI(TAG, "XIP mapped at %p. Jumping...", mapped_ptr);
+                                    vTaskDelay(pdMS_TO_TICKS(100));
+
+                                    typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
+                                    payload_entry_t launch_payload = (payload_entry_t)mapped_ptr;
+
+                                    asm volatile ("fence.i");
+                                    launch_payload(&bios_abi);
+                                } else {
+                                    ESP_LOGE(TAG, "Failed to map XIP partition!");
+                                }
+                            } else {
+                                ESP_LOGE(TAG, "Failed to copy payload to XIP partition!");
+                            }
+                        } else {
+                            ESP_LOGE(TAG, "File too large for XIP partition or partition missing!");
+                        }
+                        enter_setup = true;
+                        goto execute_boot;
+                    }
                 } else {
-                    ESP_LOGE(TAG, "Failed to map Flash partition! Code: 0x%X", err);
-                    enter_setup = true;
+                    ESP_LOGE(TAG, "payload.bin is empty! Opening Boot Menu...");
+                    boot_option_t user_choice = boot_manager_interactive_menu();
+
+                    if (user_choice == BOOT_OPT_NETWORK) should_boot = true;
+                    else if (user_choice == BOOT_OPT_SERIAL_RAM) serial_boot_ram = true;
+                    else if (user_choice == BOOT_OPT_SERIAL_FLASH) serial_boot_flash = true;
+                    else if (user_choice == BOOT_OPT_DEFAULT) direct_flash_boot = true;
+                    else if (user_choice == BOOT_OPT_SETUP) enter_setup = true;
+
                     goto execute_boot;
                 }
             } else {
-                // Partition is blank. Opening recovery console.
-                ESP_LOGE(TAG, "Flash is EMPTY! No bootable OS found.");
-                ESP_LOGI(TAG, "Opening Boot Menu for recovery...");
-
+                ESP_LOGE(TAG, "payload.bin not found inside '/downloaded/'! Opening Boot Menu...");
                 boot_option_t user_choice = boot_manager_interactive_menu();
 
-                // Map user boot selection to corresponding machine state flag
                 if (user_choice == BOOT_OPT_NETWORK) should_boot = true;
                 else if (user_choice == BOOT_OPT_SERIAL_RAM) serial_boot_ram = true;
                 else if (user_choice == BOOT_OPT_SERIAL_FLASH) serial_boot_flash = true;
@@ -506,7 +569,7 @@ void bios_core_start(void)
                 goto execute_boot;
             }
         } else {
-            ESP_LOGE(TAG, "Partition 'network_buf' is missing!");
+            ESP_LOGE(TAG, "Partition 'openc6_fs' is missing!");
             enter_setup = true;
             goto execute_boot;
         }
@@ -522,13 +585,12 @@ void bios_core_start(void)
         web_ui_start();
         ESP_LOGI(TAG, "AP '%s' is active. Connect to 192.168.4.1", BIOS_AP_SSID);
 
-        // Infinite suspension for Setup task isolation
         while (1) {
             vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
-    // F) Power State Fallback: Initiate deep S5 sleep if no boot vectors resolved
+    // F) Power State Fallback
     if (!serial_boot_ram && !serial_boot_flash && !direct_flash_boot && !should_boot && !enter_setup) {
         ESP_LOGW(TAG, "No boot action determined. Going to S5.");
         bios_enter_s5_state();

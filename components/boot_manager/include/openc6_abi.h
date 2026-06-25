@@ -72,4 +72,15 @@ typedef struct {
     // Retrieves the absolute size boundary of the integrated system Flash media
     uint32_t (*get_total_flash)(void);
 
+    // ─── HIGH-SPEED FILE SYSTEM INTERFACES ───────────────────────────────────
+
+    // Writes data to the partition (creates new, appends to existing, or overwrites if force=1)
+    void (*fs_write_file)(const char *name, const uint8_t *data, uint32_t len, uint32_t dir_sector, uint8_t force);
+
+    // Programmatically reads a segment of a file into the destination buffer
+    int32_t (*fs_read_file)(const char *name, uint8_t *dest, uint32_t offset, uint32_t len, uint32_t dir_sector);
+
+    // Safely deletes a file or directory from the directory tree structures
+    void (*fs_delete)(const char *name, uint32_t dir_sector);
+
 } openc6_abi_t;

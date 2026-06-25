@@ -23,6 +23,13 @@
 #include "nvram.h"
 #include "wifi_mgmt.h"
 
+// File system integration
+#include "openc6_fs.h"
+#include "hal_flash.h"
+
+// Modern ESP-IDF 5.x/6.x UART VFS drivers
+#include "driver/uart_vfs.h"
+
 #ifndef MALLOC_CAP_EXEC
 #error "RISC-V Memory Protection is ENABLED! You must disable CONFIG_ESP_SYSTEM_MEMPROT_FEATURE in menuconfig to allow RAM execution."
 #endif
@@ -59,21 +66,14 @@ static void bios_print(const char *str) {
 }
 
 static void bios_sha256(const uint8_t *input, uint32_t len, uint8_t *output) {
-    // Initialize crypto subsystem (if already initialized, it will return success safely)
     psa_crypto_init();
-
     size_t hash_len;
-    // Compute hash using the universal hardware-accelerated API
-    psa_hash_compute(PSA_ALG_SHA_256,
-                     input, len,
-                     output, 32,
-                     &hash_len);
+    psa_hash_compute(PSA_ALG_SHA_256, input, len, output, 32, &hash_len);
 }
 
 // ─── WI-FI ABI WRAPPERS ──────────────────────────────────────────────────
 
 static int32_t bios_wifi_connect(const char* ssid, const char* pass) {
-    // Override Wi-Fi credentials in NVRAM and initiate connection
     nvram_set_wifi_sta_config(ssid, pass);
     return (wifi_mgmt_start_sta() == ESP_OK) ? 0 : -1;
 }
@@ -104,9 +104,8 @@ static uint32_t bios_get_total_flash(void) {
     return 0;
 }
 
-// ─── MATHEMATICAL COMPATIBILITY ABI WRAPPERS (FPU-LESS PAYLOAD SUPPORT) ────────────────────────
+// ─── MATHEMATICAL COMPATIBILITY ABI WRAPPERS ────────────────────────
 
-// Fast integer square root (avoiding heavy floating-point calculation)
 static uint32_t bios_math_isqrt(uint32_t x) {
     uint32_t res = 0;
     uint32_t bit = 1UL << 30;
@@ -123,16 +122,31 @@ static uint32_t bios_math_isqrt(uint32_t x) {
     return res;
 }
 
-// Calculate sine inside BIOS and return fixed-point result scaled by 10000
 static int32_t bios_math_sin_deg(int32_t deg) {
     double rad = deg * (3.14159265359 / 180.0);
     return (int32_t)(sin(rad) * 10000.0);
 }
 
-// Same fixed-point scaling for cosine calculation inside BIOS
 static int32_t bios_math_cos_deg(int32_t deg) {
     double rad = deg * (3.14159265359 / 180.0);
     return (int32_t)(cos(rad) * 10000.0);
+}
+
+static void abi_fs_write_file(const char *name, const uint8_t *data, uint32_t len, uint32_t parent_id, uint8_t force) {
+    fs_write_file(name, data, len, (uint16_t)parent_id);
+}
+
+static int32_t abi_fs_read_file(const char *name, uint8_t *dest, uint32_t offset, uint32_t len, uint32_t parent_id) {
+    int16_t id = fs_find_id(name, (uint16_t)parent_id);
+    if (id < 0) return -1;
+    return fs_read_file((uint16_t)id, dest, offset, len);
+}
+
+static void abi_fs_delete(const char *name, uint32_t parent_id) {
+    int16_t id = fs_find_id(name, (uint16_t)parent_id);
+    if (id >= 0) {
+        fs_delete((uint16_t)id);
+    }
 }
 
 static const openc6_abi_t bios_abi = {
@@ -146,21 +160,20 @@ static const openc6_abi_t bios_abi = {
     .print = bios_print,
     .get_random = esp_random,
     .sha256 = bios_sha256,
-
-    // Integer-only math extensions
     .math_isqrt = bios_math_isqrt,
     .math_sin_deg = bios_math_sin_deg,
     .math_cos_deg = bios_math_cos_deg,
-
-    // Wi-Fi subsystem APIs
     .wifi_connect = bios_wifi_connect,
     .wifi_start_ap = bios_wifi_start_ap,
     .wifi_is_connected = bios_wifi_is_connected,
-
-    // System telemetry and RAM sizing
     .get_free_ram = bios_get_free_ram,
     .get_total_ram = bios_get_total_ram,
-    .get_total_flash = bios_get_total_flash
+    .get_total_flash = bios_get_total_flash,
+
+    // File System ABI exports
+    .fs_write_file = abi_fs_write_file,
+    .fs_read_file = abi_fs_read_file,
+    .fs_delete = abi_fs_delete
 };
 
 // ─── PORT DEFINITIONS & MACROS ───────────────────────────────────────────────
@@ -206,7 +219,7 @@ static void blink_menu(boot_option_t opt) {
     ESP_LOGI(TAG, "-> Current Option: [%d] %s", opt,
              opt == BOOT_OPT_NETWORK ? "Network Boot (PXE)" :
              opt == BOOT_OPT_SERIAL_RAM  ? "Serial Boot (RAM)" :
-             opt == BOOT_OPT_SERIAL_FLASH ? "Serial Boot (FLASH)" :
+             opt == BOOT_OPT_SERIAL_FLASH ? "UNIX Shell (FS)" :
              opt == BOOT_OPT_DEFAULT ? "Default OS (Flash)" : "BIOS Setup");
     led_mgmt_set_aura_mode(AURA_DISABLED);
     led_mgmt_blink_post(0, 255, 255, opt + 1);
@@ -245,10 +258,438 @@ boot_option_t boot_manager_interactive_menu(void) {
     }
 }
 
+// ─── MICRO UNIX SHELL (FS EXPLORER & LAUNCHER) ───────────────────────────────
+static int16_t shell_resolve_path(const char *path, uint16_t current_dir, char *out_name) {
+    uint16_t walk_dir = current_dir;
+    char temp[128];
+    strncpy(temp, path, 127);
+    temp[127] = '\0';
+
+    if (temp[0] == '/') walk_dir = 0; // Start at root
+
+    char *token = strtok(temp, "/");
+    char *last_token = NULL;
+
+    while (token != NULL) {
+        if (last_token != NULL) {
+            if (strcmp(last_token, "..") == 0) {
+                walk_dir = fs_get_parent_id(walk_dir);
+            } else if (strcmp(last_token, ".") != 0) {
+                int16_t next_id = fs_find_id(last_token, walk_dir);
+                if (next_id >= 0 && fs_get_type(next_id) == TYPE_DIR) walk_dir = next_id;
+                else return -1; // Invalid path
+            }
+        }
+        last_token = token;
+        token = strtok(NULL, "/");
+    }
+
+    if (!last_token) { out_name[0] = '\0'; return walk_dir; }
+
+    if (strcmp(last_token, "..") == 0) {
+        walk_dir = fs_get_parent_id(walk_dir);
+        out_name[0] = '\0';
+    } else if (strcmp(last_token, ".") == 0) {
+        out_name[0] = '\0';
+    } else {
+        strncpy(out_name, last_token, 17);
+        out_name[17] = '\0';
+    }
+    return walk_dir;
+}
+
+void boot_manager_shell(void) {
+    ESP_LOGW(TAG, ">>> ENTERING MICRO UNIX SHELL (REDIRECTED TO UART1) <<<");
+
+    bios_serial_init();
+    uart_vfs_dev_use_driver(PORT_NUM);
+    uart_vfs_dev_port_set_rx_line_endings(PORT_NUM, ESP_LINE_ENDINGS_CR);
+    uart_vfs_dev_port_set_tx_line_endings(PORT_NUM, ESP_LINE_ENDINGS_CRLF);
+
+    FILE *old_stdin = stdin;
+    FILE *old_stdout = stdout;
+    FILE *old_stderr = stderr;
+
+    FILE *uart1_stream = fopen("/dev/uart/1", "r+");
+    if (uart1_stream) {
+        stdin = uart1_stream;
+        stdout = uart1_stream;
+        stderr = uart1_stream;
+    }
+
+    printf("\n==================================================\n");
+    printf("        OpenC6 Micro UNIX Shell             \n");
+    printf(" Type 'help' for commands. 'exit' to reboot.\n");
+    printf("==================================================\n");
+
+    char input[128];
+    uint16_t current_dir = 0;
+
+    while (1) {
+        printf("\nopenc6_fs [Dir ID: %d] /> ", current_dir);
+        fflush(stdout);
+
+        int idx = 0;
+        memset(input, 0, sizeof(input));
+        while (idx < sizeof(input) - 1) {
+            int c = getchar();
+            if (c == EOF) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+            if (c == '\r' || c == '\n') {
+                PORT_WRITE((const uint8_t*)"\r\n", 2);
+                break;
+            } else if (c == '\b' || c == 0x7F) {
+                if (idx > 0) {
+                    idx--; input[idx] = '\0';
+                    PORT_WRITE((const uint8_t*)"\b \b", 3);
+                }
+            } else {
+                uint8_t echo_b = (uint8_t)c;
+                PORT_WRITE(&echo_b, 1);
+                input[idx++] = (char)c;
+            }
+        }
+        input[idx] = '\0';
+
+        if (strlen(input) == 0) continue;
+
+        char *cmd = strtok(input, " ");
+        if (!cmd) continue;
+
+        if (strcmp(cmd, "help") == 0) {
+            printf("Commands:\n");
+            printf("  format                  - Format file system\n");
+            printf("  ls                      - List files in current directory\n");
+            printf("  cd <path>               - Change directory\n");
+            printf("  mkdir <path>            - Create directory\n");
+            printf("  write [-f] <path> <txt> - Write text to file\n");
+            printf("  cp <src> <dst_path>     - Copy file\n");
+            printf("  mv <src> <dst_path>     - Move / Rename file\n");
+            printf("  cat <path>              - Read text file\n");
+            printf("  rm <path>               - Delete file or directory\n");
+            printf("  boot <ram|xip> <path>   - Execute binary payload\n");
+            printf("  exit                    - Exit shell and reboot system\n");
+        }
+        else if (strcmp(cmd, "exit") == 0) {
+            printf("Rebooting system...\n");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            stdin = old_stdin; stdout = old_stdout; stderr = old_stderr;
+            if (uart1_stream) fclose(uart1_stream);
+            bios_serial_deinit();
+            esp_restart();
+        }
+        else if (strcmp(cmd, "format") == 0) {
+            fs_format();
+            current_dir = 0;
+            printf("File system formatted.\n");
+        }
+        else if (strcmp(cmd, "ls") == 0) {
+            char *arg = strtok(NULL, " ");
+            if (!arg) {
+                fs_list_dir(current_dir);
+            } else {
+                char name[18];
+                int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+                if (p_dir < 0) {
+                    printf("Error: Invalid path.\n");
+                } else if (strlen(name) == 0) {
+                    fs_list_dir(p_dir);
+                } else {
+                    int16_t id = fs_find_id(name, p_dir);
+                    if (id >= 0 && fs_get_type(id) == TYPE_DIR) {
+                        fs_list_dir(id);
+                    } else {
+                        printf("Error: Directory '%s' not found.\n", name);
+                    }
+                }
+            }
+        }
+        else if (strcmp(cmd, "mkdir") == 0) {
+            char *arg = strtok(NULL, " ");
+            if (!arg) { printf("Usage: mkdir <path>\n"); continue; }
+
+            char name[18];
+            int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+            if (p_dir >= 0 && strlen(name) > 0) {
+                if (fs_mkdir(name, p_dir) >= 0) printf("Directory created.\n");
+                else printf("Error: Failed to create directory.\n");
+            } else {
+                printf("Error: Invalid path.\n");
+            }
+        }
+        else if (strcmp(cmd, "write") == 0) {
+            char *arg = strtok(NULL, " ");
+            bool force = false;
+            if (arg && strcmp(arg, "-f") == 0) {
+                force = true;
+                arg = strtok(NULL, " ");
+            }
+            char *text = strtok(NULL, "");
+
+            if (!arg || !text) { printf("Usage: write [-f] <path> <text>\n"); continue; }
+
+            char name[18];
+            int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+            if (p_dir >= 0 && strlen(name) > 0) {
+                int16_t existing_id = fs_find_id(name, p_dir);
+                int32_t existing_size = 0;
+
+                if (existing_id >= 0 && !force) {
+                    if (fs_get_type(existing_id) == TYPE_DIR) {
+                        printf("Error: Cannot write to a directory.\n");
+                        continue;
+                    }
+                    existing_size = fs_get_size(existing_id);
+                    if (existing_size < 0) existing_size = 0;
+                }
+
+                uint32_t append_len = strlen(text);
+                uint32_t total_len = existing_size + append_len;
+
+                uint8_t *buf = malloc(total_len > 0 ? total_len : 1);
+                if (buf) {
+                    if (existing_size > 0) {
+                        fs_read_file(existing_id, buf, 0, existing_size);
+                    }
+                    memcpy(buf + existing_size, text, append_len);
+
+                    if (fs_write_file(name, buf, total_len, p_dir) >= 0) {
+                        printf("%s %lu bytes (Total: %lu bytes).\n",
+                               existing_size > 0 ? "Appended" : "Written",
+                               (unsigned long)append_len, (unsigned long)total_len);
+                    } else {
+                        printf("Error: Failed to write.\n");
+                    }
+                    free(buf);
+                } else {
+                    printf("Error: Out of memory!\n");
+                }
+            } else {
+                printf("Error: Invalid path.\n");
+            }
+        }
+        else if (strcmp(cmd, "cp") == 0 || strcmp(cmd, "mv") == 0) {
+            bool is_move = (strcmp(cmd, "mv") == 0);
+            char *src_arg = strtok(NULL, " ");
+            char *dst_arg = strtok(NULL, " ");
+
+            if (!src_arg || !dst_arg) { printf("Usage: %s <src> <dst>\n", is_move ? "mv" : "cp"); continue; }
+
+            char src_name[18], dst_name[18];
+            int16_t src_dir = shell_resolve_path(src_arg, current_dir, src_name);
+            int16_t dst_dir = shell_resolve_path(dst_arg, current_dir, dst_name);
+
+            if (src_dir < 0 || strlen(src_name) == 0) { printf("Error: Invalid source path.\n"); continue; }
+            if (dst_dir < 0) { printf("Error: Invalid destination path.\n"); continue; }
+
+            int16_t src_id = fs_find_id(src_name, src_dir);
+            if (src_id < 0) { printf("Error: Source file not found.\n"); continue; }
+            if (fs_get_type(src_id) != TYPE_FILE) { printf("Error: Cannot move/copy directories.\n"); continue; }
+
+            int32_t file_size = fs_get_size(src_id);
+            if (file_size < 0) continue;
+
+            uint16_t target_dir = dst_dir;
+            char target_name[18];
+            strncpy(target_name, dst_name, 17); target_name[17] = '\0';
+
+            if (strlen(dst_name) == 0) {
+                strcpy(target_name, src_name);
+            } else {
+                int16_t dst_id = fs_find_id(dst_name, dst_dir);
+                if (dst_id >= 0) {
+                    if (fs_get_type(dst_id) == TYPE_DIR) {
+                        target_dir = dst_id;
+                        strcpy(target_name, src_name);
+                    } else if (is_move) {
+                        fs_delete(dst_id);
+                    }
+                }
+            }
+
+            uint8_t *buf = malloc(file_size > 0 ? file_size : 1);
+            if (!buf && file_size > 0) { printf("Error: Out of memory!\n"); continue; }
+
+            if (fs_read_file(src_id, buf, 0, file_size) == file_size) {
+                if (fs_write_file(target_name, buf, file_size, target_dir) >= 0) {
+                    if (is_move) fs_delete(src_id);
+                    printf("Success.\n");
+                } else {
+                    printf("Error: Failed to write.\n");
+                }
+            } else {
+                printf("Error: Failed to read source.\n");
+            }
+            free(buf);
+        }
+        else if (strcmp(cmd, "cat") == 0) {
+            char *arg = strtok(NULL, " ");
+            if (!arg) { printf("Usage: cat <path>\n"); continue; }
+
+            char name[18];
+            int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+            if (p_dir < 0 || strlen(name) == 0) { printf("Error: Invalid path.\n"); continue; }
+
+            int16_t id = fs_find_id(name, p_dir);
+            if (id >= 0 && fs_get_type(id) == TYPE_FILE) {
+                int32_t file_size = fs_get_size(id);
+                if (file_size > 0) {
+                    uint8_t chunk[64];
+                    uint32_t offset = 0;
+                    while (offset < file_size) {
+                        uint32_t read_len = (file_size - offset > sizeof(chunk)) ? sizeof(chunk) : (file_size - offset);
+                        int32_t r_bytes = fs_read_file(id, chunk, offset, read_len);
+                        if (r_bytes <= 0) break;
+                        for (int32_t b = 0; b < r_bytes; b++) putchar(chunk[b]);
+                        offset += r_bytes;
+                    }
+                    printf("\n");
+                } else {
+                    printf("File is empty.\n");
+                }
+            } else {
+                printf("Error: File not found.\n");
+            }
+        }
+        else if (strcmp(cmd, "cd") == 0) {
+            char *arg = strtok(NULL, " ");
+            if (!arg) { printf("Usage: cd <path>\n"); continue; }
+
+            char name[18];
+            int16_t target_dir = shell_resolve_path(arg, current_dir, name);
+            if (target_dir < 0) { printf("Error: Invalid path.\n"); continue; }
+
+            if (strlen(name) == 0) {
+                current_dir = target_dir;
+            } else {
+                int16_t id = fs_find_id(name, target_dir);
+                if (id >= 0 && fs_get_type(id) == TYPE_DIR) current_dir = id;
+                else printf("Error: Directory not found.\n");
+            }
+        }
+        else if (strcmp(cmd, "rm") == 0) {
+            char *arg = strtok(NULL, " ");
+            if (!arg) { printf("Usage: rm <path>\n"); continue; }
+
+            char name[18];
+            int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+            if (p_dir >= 0 && strlen(name) > 0) {
+                int16_t id = fs_find_id(name, p_dir);
+                if (id >= 0) fs_delete(id);
+                else printf("Error: Object not found.\n");
+            } else {
+                printf("Error: Invalid path.\n");
+            }
+        }
+        else if (strcmp(cmd, "boot") == 0) {
+            char *mode = strtok(NULL, " ");
+            char *arg = strtok(NULL, " ");
+
+            if (!mode || !arg || (strcmp(mode, "ram") != 0 && strcmp(mode, "xip") != 0)) {
+                printf("Usage: boot <ram|xip> <path>\n");
+                continue;
+            }
+
+            char name[18];
+            int16_t p_dir = shell_resolve_path(arg, current_dir, name);
+            if (p_dir < 0 || strlen(name) == 0) { printf("Error: Invalid path.\n"); continue; }
+
+            int16_t id = fs_find_id(name, p_dir);
+            if (id >= 0 && fs_get_type(id) == TYPE_FILE) {
+                int32_t file_size = fs_get_size(id);
+                if (file_size > 0) {
+                    if (strcmp(mode, "ram") == 0) {
+                        void *payload_ram_ptr = heap_caps_malloc(file_size, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL);
+                        if (payload_ram_ptr) {
+                            if (fs_read_file(id, payload_ram_ptr, 0, file_size) == file_size) {
+                                printf("[BOOT] Loaded to RAM. Jumping...\n\n");
+                                vTaskDelay(pdMS_TO_TICKS(100));
+
+                                stdin = old_stdin; stdout = old_stdout; stderr = old_stderr;
+                                if (uart1_stream) fclose(uart1_stream);
+                                bios_serial_deinit();
+
+                                typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
+                                payload_entry_t launch_payload = (payload_entry_t)payload_ram_ptr;
+                                asm volatile ("fence.i");
+                                launch_payload(&bios_abi);
+                            } else {
+                                printf("Error: Read failed.\n");
+                                free(payload_ram_ptr);
+                            }
+                        } else {
+                            printf("Error: Out of RAM.\n");
+                        }
+                    } else {
+                        const esp_partition_t *xip_part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0x20, "payload_xip");
+                        if (xip_part) {
+                            if (file_size <= xip_part->size) {
+                                printf("[BOOT] Erasing XIP partition...\n");
+                                esp_partition_erase_range(xip_part, 0, (file_size + 4095) & ~4095);
+
+                                printf("[BOOT] Deploying %ld bytes to XIP...\n", file_size);
+                                uint8_t buf[1024];
+                                uint32_t offset = 0;
+                                bool copy_ok = true;
+                                while (offset < file_size) {
+                                    uint32_t chunk = (file_size - offset > sizeof(buf)) ? sizeof(buf) : (file_size - offset);
+                                    if (fs_read_file(id, buf, offset, chunk) != chunk) {
+                                        copy_ok = false;
+                                        break;
+                                    }
+                                    esp_partition_write(xip_part, offset, buf, chunk);
+                                    offset += chunk;
+                                }
+
+                                if (copy_ok) {
+                                    const void *mapped_ptr = NULL;
+                                    esp_partition_mmap_handle_t mmap_handle;
+                                    if (esp_partition_mmap(xip_part, 0, file_size, ESP_PARTITION_MMAP_INST, &mapped_ptr, &mmap_handle) == ESP_OK) {
+                                        printf("[BOOT] XIP mapped. Jumping...\n\n");
+                                        vTaskDelay(pdMS_TO_TICKS(100));
+
+                                        stdin = old_stdin; stdout = old_stdout; stderr = old_stderr;
+                                        if (uart1_stream) fclose(uart1_stream);
+                                        bios_serial_deinit();
+
+                                        typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
+                                        payload_entry_t launch_payload = (payload_entry_t)mapped_ptr;
+                                        asm volatile ("fence.i");
+                                        launch_payload(&bios_abi);
+                                    } else {
+                                        printf("Error: MMAP failed.\n");
+                                    }
+                                } else {
+                                    printf("Error: Copy to XIP partition failed.\n");
+                                }
+                            } else {
+                                printf("Error: File too large for XIP partition (Max %lu bytes).\n", (unsigned long)xip_part->size);
+                            }
+                        } else {
+                            printf("Error: 'payload_xip' partition not found!\n");
+                        }
+                    }
+                } else {
+                    printf("Error: File empty.\n");
+                }
+            } else {
+                printf("Error: File not found.\n");
+            }
+        }
+        else {
+            printf("Unknown command. Type 'help'.\n");
+        }
+    }
+}
+
 // ─── PAYLOAD RECEIVER AND BOOTSTRAPPER ───────────────────────────────────────
 
 bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
-    ESP_LOGW(TAG, "Entering Serial Boot Mode. Target: %s", target == PAYLOAD_TARGET_RAM ? "RAM" : "FLASH");
+    if (target == PAYLOAD_TARGET_FLASH) {
+        ESP_LOGE(TAG, "Direct Flash serial streaming is disabled to protect OpenC6 FS integrity.");
+        return false;
+    }
+
+    ESP_LOGW(TAG, "Entering Serial Boot Mode. Target: RAM");
 
     bios_serial_init();
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -264,7 +705,7 @@ bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
     uint64_t timeout_us = (uint64_t)timeout_sec * 1000000ULL;
     const char *fail_reason = "Unknown Error";
 
-    int state = 0; // State-machine tracker (0: Wait 5A, 1: Wait A5, 2-5: Read size)
+    int state = 0;
 
     while ((esp_timer_get_time() - start_time) < timeout_us) {
         uint64_t now = esp_timer_get_time();
@@ -300,38 +741,20 @@ bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
 
     file_size = (uint32_t)size_buf[0] | ((uint32_t)size_buf[1] << 8) | ((uint32_t)size_buf[2] << 16) | ((uint32_t)size_buf[3] << 24);
 
-    if (file_size == 0 || file_size > (target == PAYLOAD_TARGET_RAM ? 500000 : 5000000)) {
+    if (file_size == 0 || file_size > 500000) {
         uint8_t nak = CMD_NAK; PORT_WRITE(&nak, 1);
         fail_reason = "Invalid file size bounds configured";
         goto error_exit;
     }
 
-    // ─── MEMORY PROVISIONING (RAM OR FLASH TARGET) ───────────────────────────
-    void *payload_ram_ptr = NULL;
-    const esp_partition_t *part = NULL;
-
-    if (target == PAYLOAD_TARGET_RAM) {
-        uint32_t alloc_size = (file_size + 3) & ~3;
-        payload_ram_ptr = heap_caps_malloc(alloc_size, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL);
-        if (!payload_ram_ptr) {
-            uint8_t nak = CMD_NAK; PORT_WRITE(&nak, 1);
-            fail_reason = "Internal RAM allocation failed";
-            goto error_exit;
-        }
-    } else {
-        part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0xff, "network_buf");
-        if (!part || file_size > part->size) {
-            uint8_t nak = CMD_NAK; PORT_WRITE(&nak, 1);
-            fail_reason = "Flash partition 'network_buf' not found or size bounds exceeded";
-            goto error_exit;
-        }
-
-        // Erase target sectors in Flash (aligned to 4KB boundary offsets)
-        uint32_t erase_size = (file_size + 4095) & ~4095;
-        esp_partition_erase_range(part, 0, erase_size);
+    uint32_t alloc_size = (file_size + 3) & ~3;
+    void *payload_ram_ptr = heap_caps_malloc(alloc_size, MALLOC_CAP_EXEC | MALLOC_CAP_INTERNAL);
+    if (!payload_ram_ptr) {
+        uint8_t nak = CMD_NAK; PORT_WRITE(&nak, 1);
+        fail_reason = "Internal RAM allocation failed";
+        goto error_exit;
     }
 
-    // Handshake back: "Host system initialized and ready to stream data."
     uint8_t ack = CMD_ACK;
     PORT_WRITE(&ack, 1);
 
@@ -340,26 +763,19 @@ bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
     int chunk_accum = 0;
     uint64_t last_data_time = esp_timer_get_time();
 
-    // ─── DATA RECEIVE LOOP ───────────────────────────────────────────────────
     while (total_received < file_size) {
         int to_read = file_size - total_received;
-        if (to_read > 64) to_read = 64; // Read in max 64-byte chunks
+        if (to_read > 64) to_read = 64;
 
         int rx_len = PORT_READ(chunk_rx_buf, to_read);
 
         if (rx_len > 0) {
-            // Commit buffered chunks to target media space
-            if (target == PAYLOAD_TARGET_RAM) {
-                memcpy((uint8_t*)payload_ram_ptr + total_received, chunk_rx_buf, rx_len);
-            } else {
-                esp_partition_write(part, total_received, chunk_rx_buf, rx_len);
-            }
+            memcpy((uint8_t*)payload_ram_ptr + total_received, chunk_rx_buf, rx_len);
 
             total_received += rx_len;
             chunk_accum += rx_len;
             last_data_time = esp_timer_get_time();
 
-            // Intermittent ACK response every 64 accumulated bytes
             while (chunk_accum >= 64 || total_received == file_size) {
                 PORT_WRITE(&ack, 1);
                 chunk_accum -= 64;
@@ -375,7 +791,6 @@ bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    // Await EOT (End of Transmission) frame
     uint64_t eot_timeout = esp_timer_get_time();
     while ((esp_timer_get_time() - eot_timeout) < 1000000ULL) {
         uint8_t eot_buf;
@@ -385,31 +800,18 @@ bool boot_manager_serial_listen(int timeout_sec, payload_target_t target) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    // ─── BOOT HANDOVER & LAUNCH ──────────────────────────────────────────────
     esp_log_level_set("*", ESP_LOG_INFO);
-    ESP_LOGI(TAG, "Payload Flashed (%d bytes). Target: %s", total_received, target == PAYLOAD_TARGET_RAM ? "RAM" : "FLASH");
+    ESP_LOGI(TAG, "Payload Flashed (%d bytes). Target: RAM", total_received);
     led_mgmt_set_color(0, 255, 0);
     vTaskDelay(pdMS_TO_TICKS(100));
 
     bios_serial_deinit();
 
-    // Declarative typedef wrapper for Payload execution mapping
     typedef void (*payload_entry_t)(const openc6_abi_t *) __attribute__((noreturn));
+    payload_entry_t launch_payload = (payload_entry_t)payload_ram_ptr;
 
-    payload_entry_t launch_payload = NULL;
-    esp_partition_mmap_handle_t mmap_handle;
-
-    if (target == PAYLOAD_TARGET_RAM) {
-        launch_payload = (payload_entry_t)payload_ram_ptr;
-    } else {
-        const void *mapped_ptr = NULL;
-        // Map Flash block into virtual instruction cache via MMU (XIP)
-        esp_partition_mmap(part, 0, file_size, ESP_PARTITION_MMAP_INST, &mapped_ptr, &mmap_handle);
-        launch_payload = (payload_entry_t)mapped_ptr;
-    }
-
-    asm volatile ("fence.i"); // Synchronize instruction cache pipeline
-    launch_payload(&bios_abi); // Yield control to payload with active ABI pointer!
+    asm volatile ("fence.i");
+    launch_payload(&bios_abi);
 
     while (1);
 
