@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Hardware: ESP32-C6](https://img.shields.io/badge/Hardware-ESP32--C6-red.svg)](https://www.espressif.com/en/products/socs/esp32-c6)
 [![Architecture: RISC-V](https://img.shields.io/badge/Architecture-RISC--V-orange.svg)](https://riscv.org/)
+[![Donate](https://img.shields.io/badge/Donate-Monobank-blue?logo=monobank)](https://send.monobank.ua/jar/9UcKZ4zVnu)
 
 <p align="center">
   <a href="https://trendshift.io/repositories/54987?utm_source=trendshift-badge&utm_medium=badge&utm_campaign=badge-trendshift-54987" target="_blank" rel="noopener noreferrer">
