@@ -163,3 +163,8 @@ This project is actively evolving. Pull requests and community contributions are
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details. Let's change the embedded development paradigm together!
+
+---
+
+## 🇺🇦 Stand with Ukraine
+This project supports Ukraine's fight for freedom. Consider donating to verified charities like [Come Back Alive](https://savelife.in.ua/en/).
