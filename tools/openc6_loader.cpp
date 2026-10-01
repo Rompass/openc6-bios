@@ -42,6 +42,9 @@ public:
         tty.c_cflag &= ~CSTOPB;
         tty.c_cflag &= ~CRTSCTS;
 
+        /* Prevent Linux from dropping DTR and hardware-resetting the ESP32 upon close */
+        tty.c_cflag &= ~HUPCL;
+
         if (tcsetattr(fd, TCSANOW, &tty) != 0) throw std::runtime_error("Error from tcsetattr");
     }
 
@@ -63,6 +66,10 @@ public:
         ssize_t res = read(fd, &byte, 1);
         return (res == 1);
     }
+
+    void flush_input() {
+        tcflush(fd, TCIFLUSH);
+    }
 };
 
 void draw_progress(size_t current, size_t total) {
@@ -81,7 +88,7 @@ void draw_progress(size_t current, size_t total) {
 
 int main(int argc, char* argv[]) {
     std::cout << "==========================================\n";
-    std::cout << " OpenC6 BIOS - Payload Loader (Robust Sync)\n";
+    std::cout << " OpenC6 BIOS - Payload Loader (Native USB)\n";
     std::cout << "==========================================\n";
 
     if (argc != 3) {
@@ -90,7 +97,10 @@ int main(int argc, char* argv[]) {
     }
 
     std::ifstream file(argv[2], std::ios::binary | std::ios::ate);
-    if (!file) return 1;
+    if (!file) {
+        std::cerr << "Error: Cannot open file " << argv[2] << "\n";
+        return 1;
+    }
     std::streamsize file_size = file.tellg();
     file.seekg(0, std::ios::beg);
 
@@ -99,9 +109,9 @@ int main(int argc, char* argv[]) {
 
     try {
         SerialPort serial(argv[1]);
-        tcflush(serial.get_fd(), TCIOFLUSH);
+        serial.flush_input();
 
-        std::cout << "Waiting for Text Marker '##OPENC6_SYNC##' from BIOS...\n";
+        std::cout << "Waiting for Sync Beacon '##OPENC6_SYNC##' from OpenC6...\n";
 
         std::string buffer;
         bool synced = false;
@@ -120,11 +130,15 @@ int main(int argc, char* argv[]) {
         }
 
         if (!synced) {
-            std::cerr << "\nERROR: Handshake Timeout! BIOS did not send SYNC marker.\n";
+            std::cerr << "\nERROR: Handshake Timeout! OpenC6 did not respond.\n";
             return 1;
         }
 
-        std::cout << "BIOS is ready! Sending file size with Magic Preambule...\n";
+        /* Flush remaining sync bytes from OS input buffer */
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        serial.flush_input();
+
+        std::cout << "OpenC6 is ready! Sending file size (" << file_size << " bytes)...\n";
 
         uint8_t size_buf[6] = {
             0x5A, 0xA5,
@@ -135,31 +149,28 @@ int main(int argc, char* argv[]) {
         };
         serial.write_data(size_buf, 6);
 
-        std::cout << "Waiting for BIOS to allocate RAM or Erase Flash...\n";
-        auto erase_wait_start = std::chrono::steady_clock::now();
+        auto ack_wait_start = std::chrono::steady_clock::now();
         bool ack_received = false;
 
-        while (std::chrono::steady_clock::now() - erase_wait_start < std::chrono::seconds(10)) {
+        /* Filter out any stray sync characters and wait strictly for ACK or NAK */
+        while (std::chrono::steady_clock::now() - ack_wait_start < std::chrono::seconds(5)) {
             if (serial.read_byte(rx_byte)) {
-                ack_received = true;
-                break;
+                if (rx_byte == CMD_ACK) {
+                    ack_received = true;
+                    break;
+                } else if (rx_byte == CMD_NAK) {
+                    std::cerr << "\nERROR: OpenC6 rejected file size (Exceeds Sandbox Arena)!\n";
+                    return 1;
+                }
             }
         }
 
         if (!ack_received) {
-            std::cerr << "ERROR: Timeout waiting for size ACK (Flash erase took too long?)!\n";
+            std::cerr << "\nERROR: Timeout waiting for ACK.\n";
             return 1;
         }
 
-        if (rx_byte == CMD_NAK) {
-            std::cerr << "ERROR: BIOS rejected file size! (Out of IRAM or Flash?)\n";
-            return 1;
-        } else if (rx_byte != CMD_ACK) {
-            std::cerr << "ERROR: Unexpected response: 0x" << std::hex << (int)rx_byte << "\n";
-            return 1;
-        }
-
-        std::cout << "Flashing Payload...\n";
+        std::cout << "Streaming payload to OpenC6...\n";
         size_t total_sent = 0;
 
         while (total_sent < file_size) {
@@ -167,8 +178,19 @@ int main(int argc, char* argv[]) {
 
             serial.write_data(payload.data() + total_sent, chunk);
 
-            if (!serial.read_byte(rx_byte) || rx_byte != CMD_ACK) {
-                std::cerr << "\nERROR: Failed waiting for ACK at offset " << total_sent << "!\n";
+            uint8_t chunk_ack = 0;
+            auto chunk_wait = std::chrono::steady_clock::now();
+            bool got_chunk_ack = false;
+
+            while (std::chrono::steady_clock::now() - chunk_wait < std::chrono::seconds(2)) {
+                if (serial.read_byte(chunk_ack) && chunk_ack == CMD_ACK) {
+                    got_chunk_ack = true;
+                    break;
+                }
+            }
+
+            if (!got_chunk_ack) {
+                std::cerr << "\nERROR: Lost ACK at offset " << total_sent << "!\n";
                 return 1;
             }
 
@@ -176,11 +198,10 @@ int main(int argc, char* argv[]) {
             draw_progress(total_sent, file_size);
         }
 
-        std::cout << "\nTransmission 100% Complete.\n";
+        std::cout << "\nTransmission Complete. Sending EOT...\n";
         uint8_t eot = CMD_EOT;
         serial.write_data(&eot, 1);
-        std::cout << "EOT sent. BIOS is jumping to Payload!\n";
-        std::cout << "SUCCESS.\n";
+        std::cout << "SUCCESS: Payload deployed.\n";
 
     } catch (const std::exception& e) {
         std::cerr << "EXCEPTION: " << e.what() << "\n";

@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include "hw_usb.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_task_wdt.h"
+#include "esp_wifi.h"
+#include "wifi_mgmt.h"
+#include "me_shared.h"
 
 #define MAX_FILES_LIMIT 1024
 #define FS_MAGIC_SKIP 0xEEEE
@@ -178,6 +185,8 @@ static void gc_step(void) {
         flash_read(curr, (uint8_t*)&magic, 2);
         flash_read(curr + 2, (uint8_t*)&tlen, 2);
 
+        if (tlen == 0 || tlen > SECTOR_SIZE) break;
+
         if (magic == FS_MAGIC_SKIP) {
             curr += tlen;
             continue;
@@ -211,11 +220,36 @@ static void check_gc(uint32_t needed_space) {
     }
 }
 
+/**
+ * @brief Erases all sectors in data partition, resetting filesystem to blank circular state.
+ * Yields every sector to feed the 300ms ESP-IDF hardware Interrupt Watchdog (MWDT0)
+ * and prevent SW_CPU panic resets during high-latency SPI erase operations.
+ */
 void fs_format(void) {
     uint32_t num_sectors = hal_flash_get_size() / SECTOR_SIZE;
+
+    /* Detach web tap to prevent Flash cache contention */
+    hw_usb_tap_fn_t prev_tap = g_hw_usb_tap;
+    g_hw_usb_tap = NULL;
+
+    hw_usb_print("[FS] Formatting partition (1248 sectors)...\r\n");
+
     for (uint32_t i = 0; i < num_sectors; i++) {
         flash_erase_sector(i);
+
+        /* Feed watchdogs and yield every sector (~40ms) to stay well under 300ms IWDT limit */
+        management_engine_pet_watchdog();
+        vTaskDelay(pdMS_TO_TICKS(2));
+
+        /* Print progress telemetry every 10% (128 sectors) */
+        if ((i % 128) == 0 || i == (num_sectors - 1)) {
+            char prog[32];
+            snprintf(prog, sizeof(prog), "[FS] Erasing: %lu%%\r\n",
+                     (unsigned long)(((i + 1) * 100) / num_sectors));
+            hw_usb_print(prog);
+        }
     }
+
     g_head = 0;
     g_tail = 0;
     g_node_count = 0;
@@ -226,8 +260,18 @@ void fs_format(void) {
     }
     g_node_capacity = 0;
     invalidate_cache();
+
+    hw_usb_print("[FS] Format complete! Filesystem ready.\r\n");
+
+    /* Restore active telemetry tap */
+    g_hw_usb_tap = prev_tap;
 }
 
+/**
+ * @brief Mounts and parses circular log-structured filesystem from SPI Flash.
+ * Reconstructs active head/tail ring pointers and in-memory node index.
+ * Automatically initializes clean empty state if all partition sectors are blank (0xFF).
+ */
 void fs_init(void) {
     if (g_nodes) {
         free(g_nodes);
@@ -243,17 +287,35 @@ void fs_init(void) {
     uint32_t num_sectors = hal_flash_get_size() / SECTOR_SIZE;
     uint32_t gap_start = 0xFFFFFFFF;
     uint32_t gap_end = 0xFFFFFFFF;
+    bool has_any_data = false;
 
+    /* Single pass over sector headers to detect ring wrap-around boundary and payload presence */
     for (uint32_t i = 0; i < num_sectors; i++) {
         uint32_t current, next;
         flash_read(i * SECTOR_SIZE, (uint8_t*)&current, 4);
         flash_read(((i + 1) % num_sectors) * SECTOR_SIZE, (uint8_t*)&next, 4);
 
+        if (current != 0xFFFFFFFF) {
+            has_any_data = true;
+        }
+
         if (current != 0xFFFFFFFF && next == 0xFFFFFFFF) gap_start = (i + 1) % num_sectors;
         if (current == 0xFFFFFFFF && next != 0xFFFFFFFF) gap_end = i;
     }
 
+    /* Pristine erased flash (all 0xFF): partition is blank, initialize empty ring */
+    if (!has_any_data) {
+        g_head = 0;
+        g_tail = 0;
+        g_node_count = 0;
+        g_next_id = 1;
+        ESP_LOGW(TAG, "Partition is clean/blank (0xFF). Initialized empty filesystem.");
+        return;
+    }
+
+    /* Partition contains data but circular ring boundary is corrupt -> format required */
     if (gap_start == 0xFFFFFFFF) {
+        ESP_LOGW(TAG, "Corrupted filesystem ring detected. Auto-formatting partition...");
         fs_format();
         return;
     }
@@ -302,6 +364,9 @@ void fs_init(void) {
             break;
         }
     }
+    /* Print final mount summary strictly once */
+    ESP_LOGI(TAG, "Filesystem mounted: %d files/dirs indexed (Head: 0x%08lX, Tail: 0x%08lX)",
+             g_node_count, (unsigned long)g_head, (unsigned long)g_tail);
 }
 
 int16_t fs_find_id(const char *name, uint16_t parent_id) {
@@ -414,10 +479,8 @@ int16_t fs_write_file(const char *name, const uint8_t *data, uint32_t len, uint1
         if (chunk_len > 0) flash_write(g_head + sizeof(hdr), data + offset, chunk_len);
 
         uint32_t pad_bytes = padded_len - (sizeof(RecordHeader) + chunk_len);
-        if (pad_bytes > 0) {
-            uint32_t fff = 0xFFFFFFFF;
-            flash_write(g_head + sizeof(hdr) + chunk_len, (uint8_t*)&fff, pad_bytes);
-        }
+        /* Sector is already erased (0xFF), no need to write padding bytes */
+        (void)pad_bytes;
 
         g_head = (g_head + padded_len) % hal_flash_get_size();
 
@@ -465,18 +528,34 @@ int32_t fs_read_file(uint16_t id, uint8_t *dest, uint32_t offset, uint32_t len) 
     return read_count;
 }
 
+/**
+ * @brief Lists directory contents directly to USB CDC FIFO bypassing Newlib buffering.
+ *
+ * @param parent_id Target directory sector identifier.
+ */
 void fs_list_dir(uint16_t parent_id) {
-    printf("Listing directory (ID: %d):\n", parent_id);
-    printf("%-5s %-4s %-16s %s\n", "ID", "TYPE", "NAME", "SIZE");
-    printf("----------------------------------------\n");
+    char line[128];
+    snprintf(line, sizeof(line), "Listing directory (ID: %u):\r\n", parent_id);
+    hw_usb_print(line);
+
+    hw_usb_print("ID    TYPE NAME             SIZE\r\n");
+    hw_usb_print("----------------------------------------\r\n");
+
+    int found = 0;
     for (int i = 0; i < g_node_count; i++) {
         if (g_nodes[i].parent_id == parent_id) {
-            printf("%-5d %-4s %-16s %lu\n",
-                   g_nodes[i].id,
-                   g_nodes[i].type == TYPE_DIR ? "DIR" : "FILE",
-                   g_nodes[i].name,
-                   (unsigned long)g_nodes[i].size);
+            snprintf(line, sizeof(line), "%-5u %-4s %-16s %lu\r\n",
+                     g_nodes[i].id,
+                     g_nodes[i].type == TYPE_DIR ? "DIR" : "FILE",
+                     g_nodes[i].name,
+                     (unsigned long)g_nodes[i].size);
+            hw_usb_print(line);
+            found++;
         }
+    }
+
+    if (found == 0) {
+        hw_usb_print("  (empty directory)\r\n");
     }
 }
 

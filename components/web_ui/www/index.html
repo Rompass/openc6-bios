@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>OpenC6 BIOS Setup</title>
+    <title>OpenC6 BIOS v2.0 Setup</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: 'Courier New', monospace; background: #0000AA; color: #CCCCCC; padding: 15px; text-transform: uppercase; }
@@ -32,13 +32,12 @@
 
         .info-pane { background: #000000; padding: 15px; border: 2px solid #CCCCCC; margin-bottom: 10px; font-size: 1em; line-height: 1.6; }
         .highlight { color: #55FF55; font-weight: bold; }
-        .me-badge { color: #FFFF55; font-weight: bold; }
         .temp-warning { color: #FF5555; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="box">
-        <h1>OPENC6 BIOS SETUP UTILITY</h1>
+        <h1>OPENC6 BIOS SETUP UTILITY v2.0</h1>
 
         <div id="settings-form">
             <!-- Real-time Hardware Monitor -->
@@ -90,13 +89,15 @@
                 <input type="number" id="temp_em" min="50" max="95" style="max-width: 80px;">
             </div>
 
-            <!-- Main Config & ME -->
+            <!-- Main Configuration & ZSWAP -->
             <h2>Main Configuration</h2>
             <div class="row">
-                <span>Management Engine (ME):</span>
-                <select id="me_enable">
-                    <option value="1">Enabled (Active S5)</option>
-                    <option value="0">Disabled (Legacy)</option>
+                <span>ZC6 Swap Engine:</span>
+                <select id="zc6_swap">
+                    <option value="3">Both (Flash .zc6 + RAM ZSWAP)</option>
+                    <option value="1">Flash Only (.zc6 Decompress)</option>
+                    <option value="2">RAM Only (ZSWAP Suspended)</option>
+                    <option value="0">Disabled (Raw .bin Only)</option>
                 </select>
             </div>
             <div class="row">
@@ -114,8 +115,15 @@
                 </select>
             </div>
 
-            <!-- Network -->
+            <!-- Network Settings -->
             <h2>Network Settings</h2>
+            <div class="row">
+                <span>Web Shell (c6wsh):</span>
+                <select id="c6wsh">
+                    <option value="0">Disabled (Default)</option>
+                    <option value="1">Enabled (Boot STA)</option>
+                </select>
+            </div>
             <div class="row">
                 <span>SSID:</span>
                 <input type="text" id="wifi_ssid" maxlength="32">
@@ -123,6 +131,16 @@
             <div class="row">
                 <span>Password:</span>
                 <input type="password" id="wifi_pass" maxlength="64">
+            </div>
+            <div class="row">
+                <span>Wi-Fi Region:</span>
+                <select id="wifi_country">
+                    <option value="UA">UA - Ukraine (CH 1-13)</option>
+                    <option value="EU">EU - Europe (CH 1-13)</option>
+                    <option value="US">US - USA / FCC (CH 1-11)</option>
+                    <option value="JP">JP - Japan (CH 1-14)</option>
+                    <option value="01">01 - World Safe (CH 1-13)</option>
+                </select>
             </div>
 
             <!-- PXE URL Target Configurator -->
@@ -155,7 +173,7 @@
         </div>
 
         <div class="footer">
-            Build: v1.3-THERMAL-ME | OpenC6 Project Firmware
+            Build: v2.0-ME-PMP-ZC6 | OpenC6 Project Firmware
         </div>
     </div>
 
@@ -169,16 +187,11 @@
                 const nvs_percent = nvs_total > 0 ? Math.round((hw.nvs_used_entries / nvs_total) * 100) : 0;
                 const ram_used = hw.ram_total_kb - hw.ram_free_kb;
 
-                // Evaluate and display Management Engine active status
-                const meEnabled = document.getElementById('me_enable').value === "1";
-                const meStatusText = meEnabled ? "<span class='highlight'>ACTIVE (WDT & THERMAL GUARD)</span>" : "<span style='color:#FF5555'>OFFLINE</span>";
-
-                // Enforce red style warnings if junction temperature exceeds 75°C
                 const tempClass = hw.cpu_temp_c >= 75 ? "temp-warning" : "highlight";
 
                 document.getElementById('sys-info').innerHTML = `
                     MAIN CORE: <span class="highlight">${hw.cpu_real_mhz} MHz</span> | TEMP: <span class="${tempClass}">${hw.cpu_temp_c}&deg;C</span><br>
-                    LP CORE (ME): ${meStatusText}<br>
+                    LP CORE (ME): <span class="highlight">ACTIVE (WDT & THERMAL GUARD)</span><br>
                     SYSTEM RAM: <span class="highlight">${ram_used} KB</span> / ${hw.ram_total_kb} KB IN USE<br>
                     SPI FLASH: ${hw.flash_total_mb} MB ROM<br>
                     NVRAM USAGE: ${hw.nvs_used_entries} / ${nvs_total} ENTRIES (${nvs_percent}%)
@@ -203,11 +216,12 @@
                 const res = await fetch('/api/settings');
                 const cfg = await res.json();
 
-                // Populate form configurations
                 document.getElementById('dc_loss').value = cfg.dc_loss;
                 document.getElementById('post_led').value = cfg.post_led;
+                document.getElementById('c6wsh').value = cfg.c6wsh !== undefined ? cfg.c6wsh : 0;
                 document.getElementById('wifi_ssid').value = cfg.wifi_ssid || "";
                 document.getElementById('wifi_pass').value = cfg.wifi_pass || "";
+                document.getElementById('wifi_country').value = cfg.wifi_country || "01";
                 document.getElementById('pxe_url').value = cfg.pxe_url || "";
                 document.getElementById('aura_mode').value = cfg.aura_mode || 0;
                 document.getElementById('aura_brightness').value = cfg.aura_brightness || 128;
@@ -215,12 +229,9 @@
                 document.getElementById('cpu_gov').value = cfg.cpu_gov || 0;
                 document.getElementById('bod_lvl').value = cfg.bod_lvl || 0;
 
-                // Populate safety thermal threshold metrics
                 document.getElementById('temp_th').value = cfg.temp_th !== undefined ? cfg.temp_th : 55;
                 document.getElementById('temp_em').value = cfg.temp_em !== undefined ? cfg.temp_em : 75;
-
-                // Fallback me_enable state configurations
-                document.getElementById('me_enable').value = cfg.me_enable !== undefined ? cfg.me_enable : 1;
+                document.getElementById('zc6_swap').value = cfg.zc6_swap !== undefined ? cfg.zc6_swap : 3;
 
                 refreshDynamicStats();
                 setInterval(refreshDynamicStats, 1000);
@@ -234,17 +245,17 @@
             const data = {
                 dc_loss: parseInt(document.getElementById('dc_loss').value),
                 post_led: parseInt(document.getElementById('post_led').value),
+                c6wsh: parseInt(document.getElementById('c6wsh').value),
                 wifi_ssid: document.getElementById('wifi_ssid').value,
                 wifi_pass: document.getElementById('wifi_pass').value,
-                pxe_url: document.getElementById('pxe_url').value,           // Transmit to ESP32 core
+                wifi_country: document.getElementById('wifi_country').value,
+                pxe_url: document.getElementById('pxe_url').value,
                 aura_mode: parseInt(document.getElementById('aura_mode').value),
                 aura_brightness: parseInt(document.getElementById('aura_brightness').value),
                 cpu_freq: parseInt(document.getElementById('cpu_freq').value),
                 cpu_gov: parseInt(document.getElementById('cpu_gov').value),
                 bod_lvl: parseInt(document.getElementById('bod_lvl').value),
-                me_enable: parseInt(document.getElementById('me_enable').value),
-
-                // Include safety thermal threshold metrics inside payload
+                zc6_swap: parseInt(document.getElementById('zc6_swap').value),
                 temp_th: parseInt(document.getElementById('temp_th').value),
                 temp_em: parseInt(document.getElementById('temp_em').value)
             };
@@ -262,13 +273,12 @@
         }
 
         async function loadDefaults() {
-            if(confirm("LOAD OPTIMIZED DEFAULTS?")) {
+            if (confirm("LOAD OPTIMIZED DEFAULTS?")) {
                 await fetch('/api/defaults', { method: 'POST' });
                 location.reload();
             }
         }
 
-        // Handle wireless BIOS firmware OTA update triggers
         async function triggerNetworkOTA() {
             const pxeUrl = document.getElementById('pxe_url').value;
             if (!pxeUrl || pxeUrl.trim() === "") {
