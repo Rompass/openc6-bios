@@ -43,6 +43,10 @@ Safe host firmware flashing over Wi-Fi backed by hardware A/B partition rollback
 Single-cycle atomic WS2812 driver scaling pulse timings to match active CPU frequency (80/120/160 MHz).
 ![OpenC6 Aura Sync](assets/aura_sync.gif)
 
+### 7. Automated C99 TUI Installer
+Freestanding zero-dependency terminal setup wizard automating host prerequisites and ESP-IDF v6.1 deployment.
+![OpenC6 Automated Installer](assets/installer.jpg)
+
 ---
 
 ## Key Architectural Systems
@@ -143,6 +147,8 @@ Connect to the USB Type-C interface using any serial monitor (115200 baud, 8N1):
 
 ### 1. Automated Installation (Recommended)
 OpenC6 features a standalone C99 TUI deployment wizard that automatically configures host prerequisites, installs the ESP-IDF v6.1 RISC-V toolchain, compiles the BIOS, wipes stale flash partitions, and programs the target hardware.
+
+![OpenC6 Build Execution](assets/installer_build.jpg)
 
 Ensure `make` is installed on your host system:
 ```bash
