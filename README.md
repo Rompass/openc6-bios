@@ -47,6 +47,10 @@ Single-cycle atomic WS2812 driver scaling pulse timings to match active CPU freq
 Freestanding zero-dependency terminal setup wizard automating host prerequisites and ESP-IDF v6.1 deployment.
 ![OpenC6 Automated Installer](assets/installer.jpg)
 
+### 8. ZSWAP In-Memory Page Compression
+Suspended background process memory pages compressed in RAM via the custom ZC6 v4 engine (12 KB process compressed down to 1055 B, releasing 10 KB of physical arena pages back to the pool).
+![OpenC6 ZSWAP Compression](assets/zswap.jpg)
+
 ---
 
 ## Key Architectural Systems

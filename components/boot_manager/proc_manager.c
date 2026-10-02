@@ -500,6 +500,8 @@ esp_err_t proc_spawn_mem(const char *path, uint16_t current_dir, bool background
         return ESP_ERR_NO_MEM;
     }
 
+    memset(slot_base, 0, alloc_size);
+
     /* Stage executable binary into allocated pages (Transparent ZC6 decompression) */
     if (is_zc6) {
         uint8_t *comp_buf = (uint8_t *)malloc((size_t)file_size);
