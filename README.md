@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Hardware: ESP32-C6](https://img.shields.io/badge/Hardware-ESP32--C6-red.svg)](https://www.espressif.com/en/products/socs/esp32-c6)
 [![Architecture: RISC-V](https://img.shields.io/badge/Architecture-RISC--V-orange.svg)](https://riscv.org/)
+[![Reddit: r/OpenC6](https://img.shields.io/badge/Reddit-r%2FOpenC6-FF4500?logo=reddit&logoColor=white)](https://reddit.com/r/OpenC6)
 [![Donate](https://img.shields.io/badge/Donate-Monobank-blue?logo=monobank)](https://send.monobank.ua/jar/9UcKZ4zVnu)
 
 <p align="center">
@@ -251,6 +252,14 @@ Refer to **[Payload Development & ABI Reference](docs/payload_development.md)**.
 ## Project Roadmap
 
 * **Unified Hardware Abstraction Layer (HAL):** Decoupling architecture-specific drivers (PMP, LP-Core coprocessor, PCR registers, USB CDC) into a modular HAL interface to enable flexible porting across other RISC-V platforms and targets.
+
+---
+
+## Community
+
+Discussions, payload showcases, hardware hacking experiments, and announcements are hosted on our official subreddit:
+
+**Join the discussion on Reddit: [r/OpenC6](https://reddit.com/r/OpenC6)**
 
 ---
 
