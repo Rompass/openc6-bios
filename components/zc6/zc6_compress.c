@@ -2,21 +2,45 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef ZC6_TELEMETRY
+# include <stdio.h>
+# define ZC6_STAT(x) do { x; } while (0)
+#else
+# define ZC6_STAT(x) do { } while (0)
+#endif
+
 /*
  * ============================================================================
- * OpenC6 ZC6-Lite Embedded Payload Compressor (Microkernel ZSWAP Engine)
- * Low-footprint match finder (~1.2 KB RAM during compression) for ESP32-C6.
+ * OpenC6 ZC6 v4 Payload Compressor
  * ============================================================================
  */
 
-#define ZC6_HASH_SIZE            256U
-#define ZC6_HASH_MASK            (ZC6_HASH_SIZE - 1U)
-#define ZC6_HASH_WAYS            2U
+#ifndef ZC6_HASH_SIZE
+# ifdef ESP_PLATFORM
+#  define ZC6_HASH_SIZE   256U    /* ~1.2 KB RAM */
+#  define ZC6_HASH_WAYS   2U
+# else
+#  define ZC6_HASH_SIZE   4096U
+#  define ZC6_HASH_WAYS   8U
+# endif
+#endif
+
+#define ZC6_HASH_MASK     (ZC6_HASH_SIZE - 1U)
 
 typedef struct {
     uint16_t entries[ZC6_HASH_SIZE][ZC6_HASH_WAYS];
     uint8_t  head[ZC6_HASH_SIZE];
 } zc6_match_finder_t;
+
+typedef struct {
+    size_t tiny_count, tiny_in, tiny_out;
+    size_t short_count, short_in, short_out;
+    size_t long_count, long_in, long_out;
+    size_t rle_count, rle_in, rle_out;
+    size_t zero_count, zero_in, zero_out;
+    size_t sparse_count, sparse_in, sparse_out;
+    size_t lit_chunks, lit_bytes, lit_overhead;
+} zc6_stats_t;
 
 /**
  * @brief Computes standard IEEE 802.3 CRC32 checksum.
@@ -34,12 +58,10 @@ static uint32_t zc6_crc32(const uint8_t *data, size_t len)
 }
 
 /**
- * @brief Flushes accumulated raw literals into stream using ZC6_OP_SPECIAL (0xC0).
- * Maximum literal chunk size is 32 bytes (params 0x00..0x1F).
+ * @brief Flushes accumulated raw literals into stream and records telemetry.
  */
 static size_t flush_literals(uint8_t *dst, size_t dst_cap, size_t dst_idx,
-                             const uint8_t *lit_src, size_t count,
-                             void *unused __attribute__((unused)))
+                             const uint8_t *lit_src, size_t count, zc6_stats_t *st)
 {
     size_t written = 0;
     size_t offset = 0;
@@ -55,6 +77,14 @@ static size_t flush_literals(uint8_t *dst, size_t dst_cap, size_t dst_idx,
 
         memcpy(&dst[dst_idx + written], &lit_src[offset], chunk);
         written += chunk;
+
+        #ifdef ZC6_TELEMETRY
+        if (st) {
+            ZC6_STAT(st->lit_chunks++);
+            ZC6_STAT(st->lit_bytes += chunk);
+            ZC6_STAT(st->lit_overhead++);
+        }
+        #endif
 
         offset += chunk;
     }
@@ -105,6 +135,30 @@ static inline void find_best_match(zc6_match_finder_t *mf, const uint8_t *src, s
     }
 }
 
+#ifdef ZC6_TELEMETRY
+static void print_telemetry(const zc6_stats_t *st, size_t raw_len, size_t comp_len)
+{
+    printf("    [ZC6 TELEMETRY] Byte Stream Distribution:\n");
+    printf("      ├── Tiny Matches (1B)   : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->tiny_count, st->tiny_in, st->tiny_out, (st->tiny_in > st->tiny_out ? st->tiny_in - st->tiny_out : 0));
+    printf("      ├── Short Matches (2B)  : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->short_count, st->short_in, st->short_out, (st->short_in > st->short_out ? st->short_in - st->short_out : 0));
+    printf("      ├── Long Matches (3B)   : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->long_count, st->long_in, st->long_out, (st->long_in > st->long_out ? st->long_in - st->long_out : 0));
+    printf("      ├── Byte RLE            : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->rle_count, st->rle_in, st->rle_out, (st->rle_in > st->rle_out ? st->rle_in - st->rle_out : 0));
+    printf("      ├── Zero-Word Runs      : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->zero_count, st->zero_in, st->zero_out, (st->zero_in > st->zero_out ? st->zero_in - st->zero_out : 0));
+    printf("      ├── Sparse 32-bit Words : %3zu tokens | In: %4zu B -> Out: %4zu B (Saved: %4zu B)\n",
+           st->sparse_count, st->sparse_in, st->sparse_out, (st->sparse_in > st->sparse_out ? st->sparse_in - st->sparse_out : 0));
+    printf("      └── Raw Literals        : %3zu chunks | Data: %4zu B + Tags: %2zu B = %4zu B (%.1f%% of raw)\n",
+           st->lit_chunks, st->lit_bytes, st->lit_overhead, st->lit_bytes + st->lit_overhead,
+           ((double)st->lit_bytes / (double)raw_len) * 100.0);
+    printf("      ----------------------------------------------------------------------------------\n");
+    printf("      Total Payload: %zu B raw -> %zu B comp (Header: 20 B)\n", raw_len, comp_len);
+}
+#endif
+
 bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compressed)
 {
     if (!src || src_len == 0 || !out_compressed || !out_compressed->data) {
@@ -123,6 +177,9 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
     if (!mf) {
         return false;
     }
+
+    zc6_stats_t st = {0};
+    (void)st;
 
     size_t src_idx = 0;
     size_t lit_start = 0;
@@ -235,7 +292,7 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
             /* A. Take Byte RLE */
             if (rle_savings > 0 && rle_savings >= lz_savings && rle_savings >= zero_savings) {
                 if (lit_count > 0) {
-                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, NULL);
+                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, &st);
                     if (fl == 0) { free(mf); return false; }
                     dst_idx += fl;
                     lit_count = 0;
@@ -244,11 +301,16 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
                 if (rle_len <= 19) {
                     dst[dst_idx++] = (uint8_t)(ZC6_OP_SPECIAL | (ZC6_SPECIAL_RLE_SHORT + (rle_len - 4)));
                     dst[dst_idx++] = rle_val;
+                    ZC6_STAT(st.rle_out += 2);
                 } else {
                     dst[dst_idx++] = (uint8_t)(ZC6_OP_SPECIAL | ZC6_SPECIAL_RLE_LONG);
                     dst[dst_idx++] = (uint8_t)rle_len;
                     dst[dst_idx++] = rle_val;
+                    ZC6_STAT(st.rle_out += 3);
                 }
+
+                ZC6_STAT(st.rle_count++);
+                ZC6_STAT(st.rle_in += rle_len);
 
                 for (size_t k = 1; k < rle_len; k++) {
                     mf_insert(mf, src, src_len, src_idx + k);
@@ -262,7 +324,7 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
             /* B. Take Zero-Word Run */
             if (zero_savings > 0 && zero_savings >= lz_savings) {
                 if (lit_count > 0) {
-                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, NULL);
+                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, &st);
                     if (fl == 0) { free(mf); return false; }
                     dst_idx += fl;
                     lit_count = 0;
@@ -270,6 +332,10 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
 
                 dst[dst_idx++] = (uint8_t)(ZC6_OP_SPECIAL | ZC6_SPECIAL_ZERO_RUN);
                 dst[dst_idx++] = (uint8_t)zero_words;
+
+                ZC6_STAT(st.zero_count++);
+                ZC6_STAT(st.zero_in += (zero_words * 4));
+                ZC6_STAT(st.zero_out += 2);
 
                 for (size_t k = 1; k < zero_words * 4; k++) {
                     mf_insert(mf, src, src_len, src_idx + k);
@@ -283,7 +349,7 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
             /* C. Take TinyLZ Match (Tiny 1B, Short 2B, or Long 3B) */
             if (lz_savings > 0 && lz_savings >= sparse_savings) {
                 if (lit_count > 0) {
-                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, NULL);
+                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, &st);
                     if (fl == 0) { free(mf); return false; }
                     dst_idx += fl;
                     lit_count = 0;
@@ -293,13 +359,25 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
                     uint8_t len_bits = (uint8_t)((best_len - ZC6_TINY_LEN_MIN) & 0x03);
                     uint8_t dist_bits = (uint8_t)((best_dist - 1) & 0x0F);
                     dst[dst_idx++] = (uint8_t)(ZC6_OP_TINY_MATCH | (len_bits << 4) | dist_bits);
+
+                    ZC6_STAT(st.tiny_count++);
+                    ZC6_STAT(st.tiny_in += best_len);
+                    ZC6_STAT(st.tiny_out += 1);
                 } else if (best_dist <= ZC6_SHORT_DIST_MAX) {
                     dst[dst_idx++] = (uint8_t)(ZC6_OP_SHORT_MATCH | (best_len - ZC6_MIN_MATCH_LEN));
                     dst[dst_idx++] = (uint8_t)best_dist;
+
+                    ZC6_STAT(st.short_count++);
+                    ZC6_STAT(st.short_in += best_len);
+                    ZC6_STAT(st.short_out += 2);
                 } else {
                     dst[dst_idx++] = (uint8_t)(ZC6_OP_LONG_MATCH | (best_len - ZC6_MIN_MATCH_LEN));
                     dst[dst_idx++] = (uint8_t)(best_dist & 0xFF);
                     dst[dst_idx++] = (uint8_t)((best_dist >> 8) & 0xFF);
+
+                    ZC6_STAT(st.long_count++);
+                    ZC6_STAT(st.long_in += best_len);
+                    ZC6_STAT(st.long_out += 3);
                 }
 
                 for (size_t k = 1; k < best_len; k++) {
@@ -314,7 +392,7 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
             /* D. Take Sparse 32-bit Word */
             if (sparse_savings > 0) {
                 if (lit_count > 0) {
-                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, NULL);
+                    size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, &st);
                     if (fl == 0) { free(mf); return false; }
                     dst_idx += fl;
                     lit_count = 0;
@@ -325,6 +403,10 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
                 if (sparse_mask & 2) dst[dst_idx++] = src[src_idx + 1];
                 if (sparse_mask & 4) dst[dst_idx++] = src[src_idx + 2];
                 if (sparse_mask & 8) dst[dst_idx++] = src[src_idx + 3];
+
+                ZC6_STAT(st.sparse_count++);
+                ZC6_STAT(st.sparse_in += 4);
+                ZC6_STAT(st.sparse_out += (1 + non_zero_count));
 
                 for (size_t k = 1; k < 4; k++) {
                     mf_insert(mf, src, src_len, src_idx + k);
@@ -341,10 +423,14 @@ bool zc6_compress(const uint8_t *src, size_t src_len, zc6_mem_buf_t *out_compres
     }
 
     if (lit_count > 0) {
-        size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, NULL);
+        size_t fl = flush_literals(dst, dst_cap, dst_idx, &src[lit_start], lit_count, &st);
         if (fl == 0) { free(mf); return false; }
         dst_idx += fl;
     }
+
+    #ifdef ZC6_TELEMETRY
+    print_telemetry(&st, src_len, dst_idx);
+    #endif
 
     free(mf);
 

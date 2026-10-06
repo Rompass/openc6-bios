@@ -3,8 +3,6 @@ idf_component_register(
         "boot_menu.c"
         "boot_shell.c"
         "proc_manager.c"
-        "zc6_decompress.c"
-        "zc6_compress.c"
     INCLUDE_DIRS
         "include"
     REQUIRES
@@ -22,4 +20,5 @@ idf_component_register(
         openc6_fs
         sandbox
         openc6_abi
+        zc6
 )
