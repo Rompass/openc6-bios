@@ -12,4 +12,5 @@ idf_component_register(
         openc6_abi
         management_engine
         led_mgmt
+        openc6_hal
 )

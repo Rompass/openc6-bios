@@ -21,4 +21,5 @@ idf_component_register(
         sandbox
         openc6_abi
         zc6
+        openc6_hal
 )
