@@ -10,7 +10,9 @@
 #define ME_BOOT_REASON_THERMAL      5  /* Emergency Thermal Reset: Junction temp exceeded safety ceiling */
 
 /* Status Flags (Shared LP-RAM)
- * The ESP32-C6 ULP toolchain automatically prefixes exported symbols with "ulp_" */
+ * The ESP32-C6 ULP toolchain automatically prefixes exported symbols with "ulp_".
+ * ESP32-C3 has no LP-Core, so these are ordinary HP-Core globals (defined in
+ * management_engine.c) instead of ULP-linker-exported symbols. */
 
 extern uint32_t ulp_me_hp_is_awake;
 extern uint32_t ulp_me_boot_reason;

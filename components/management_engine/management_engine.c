@@ -1,12 +1,30 @@
 #include "management_engine.h"
 #include "me_shared.h"
-#include "ulp_lp_core.h"
-#include "me_core.h"
 #include "esp_log.h"
 #include "esp_system.h"
 
+#ifndef CONFIG_IDF_TARGET_ESP32C3
+/* LP-Core only available on C6 and newer */
+#include "ulp_lp_core.h"
+#include "me_core.h"
+
 extern const uint8_t me_core_bin_start[] asm("_binary_me_core_bin_start");
 extern const uint8_t me_core_bin_end[]   asm("_binary_me_core_bin_end");
+#else
+/* ESP32-C3 has no LP-Core/ULP linker exports: back the shared "ulp_me_*"
+ * symbols with plain HP-Core storage so the rest of this file (and any
+ * caller of me_shared.h) still links. Values are inert placeholders since
+ * nothing drives them without the LP-Core. */
+uint32_t ulp_me_hp_is_awake   = 0;
+uint32_t ulp_me_boot_reason   = ME_BOOT_REASON_NONE;
+uint32_t ulp_me_wdt_counter   = 0;
+uint32_t ulp_me_cpu_load      = 0;
+uint32_t ulp_me_max_freq      = 160;
+uint32_t ulp_me_target_freq   = 160;
+uint32_t ulp_me_temperature   = 0;
+uint32_t ulp_me_throttle_temp = 85;
+uint32_t ulp_me_emergency_temp = 95;
+#endif
 
 static const char *TAG = "ME_HOST";
 static bool me_active = false;
@@ -24,6 +42,13 @@ static bool is_valid_boot_reason(uint32_t r) {
 }
 
 void management_engine_init(bool is_enabled, bool is_cold_boot) {
+#ifdef CONFIG_IDF_TARGET_ESP32C3
+    /* ESP32-C3 has no LP-Core: always run in Legacy Mode (HP-Core only). */
+    (void)is_enabled;
+    (void)is_cold_boot;
+    ESP_LOGW(TAG, "Management Engine is DISABLED. System running in Legacy Mode (no LP-Core on C3).");
+    return;
+#else
     if (!is_enabled) {
         ESP_LOGW(TAG, "Management Engine is DISABLED. System running in Legacy Mode.");
         return;
@@ -47,7 +72,7 @@ void management_engine_init(bool is_enabled, bool is_cold_boot) {
 
     // Initialize LP RAM parameters strictly after binary deployment.
     // Note: get_boot_reason() has already fetched values prior to this step.
-    ulp_me_is_enabled  = 1;
+    ulp_me_is_enabled = 1;
     ulp_me_boot_reason = ME_BOOT_REASON_NONE;
 
     ulp_lp_core_cfg_t cfg = { .wakeup_source = ULP_LP_CORE_WAKEUP_SOURCE_HP_CPU };
@@ -55,6 +80,7 @@ void management_engine_init(bool is_enabled, bool is_cold_boot) {
 
     me_active = true;
     ESP_LOGI(TAG, "ME is Active. Hardware WDT & Button logic delegated to LP-Core.");
+#endif
 }
 
 bool management_engine_check_force_shutdown(void) {

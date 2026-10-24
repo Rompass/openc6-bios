@@ -2,6 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Hardware: ESP32-C6](https://img.shields.io/badge/Hardware-ESP32--C6-red.svg)](https://www.espressif.com/en/products/socs/esp32-c6)
+[![Hardware: ESP32-C3](https://img.shields.io/badge/Hardware-ESP32--C3-red.svg)](https://www.espressif.com/en/products/socs/esp32-c3)
 [![Architecture: RISC-V](https://img.shields.io/badge/Architecture-RISC--V-orange.svg)](https://riscv.org/)
 [![Reddit: r/OpenC6](https://img.shields.io/badge/Reddit-r%2FOpenC6-FF4500?logo=reddit&logoColor=white)](https://reddit.com/r/OpenC6)
 [![Donate](https://img.shields.io/badge/Donate-Monobank-blue?logo=monobank)](https://send.monobank.ua/jar/9UcKZ4zVnu)
@@ -15,6 +16,8 @@
 OpenC6 is an open-source, high-performance BIOS and microkernel architecture designed for the ESP32-C6 (RV32IMAC). It decouples platform-level hardware initialization from user-space execution, bringing PC/Workstation architecture paradigms to microcontrollers.
 
 Instead of deploying monolithic firmwares, OpenC6 acts as an operating host. It manages bare-metal silicon resources, runs an autonomous out-of-band supervisor on the LP-Core coprocessor, enforces hardware memory protection via Physical Memory Protection (PMP), and exposes a standardized System Call ABI. This allows dynamic loading, multitasking execution, and network deployment of unprivileged User-Mode (U-Mode) payloads without recompiling the host operating system.
+
+**Which target should I use?** ESP32-C6 is the primary/reference platform (LP-Core Management Engine, WiFi 6, 8 MB flash). ESP32-C3 (e.g. the low-cost "SuperMini" boards) is built from the same codebase via ESP-IDF's `CONFIG_IDF_TARGET`, with a few hardware-driven differences — see [ESP32-C3 SuperMini](#esp32-c3-supermini) below.
 
 ---
 
@@ -106,6 +109,12 @@ High-performance circular filesystem residing in a dedicated SPI Flash partition
 | **GPIO 1, 2** | `CLEAR_NVRAM` | Input / Ground | Hardware Clear CMOS jumper (Short during boot to reset) |
 | **Type-C** | Native USB | D- / D+ PHY | Direct USB CDC console, binary loader, and JTAG |
 
+### ESP32-C3 SuperMini
+
+Same power button / clear-CMOS / boot / POST LED pins as C6.
+
+**C3 hardware constraints:** no LP-Core (Management Engine runs in Legacy/HP-Core-only mode), no PSRAM, no EXT1/RTC-IO wakeup domain (uses plain GPIO wakeup instead), 4 MB flash (vs 8 MB on C6). WiFi is 802.11b/g/n instead of WiFi 6. See [ESP32-C3-SUPERMINI-PORT.md](ESP32-C3-SUPERMINI-PORT.md) for the full technical breakdown and [QUICKSTART-ESP32-C3.md](QUICKSTART-ESP32-C3.md) for a step-by-step C3 guide.
+
 ---
 
 ## Micro UNIX Shell Command Reference
@@ -177,6 +186,14 @@ If you already have ESP-IDF v6.1+ configured and sourced in your active shell:
 . $IDF_PATH/export.sh
 idf.py build erase-flash flash monitor -p /dev/ttyACM0
 ```
+
+`sdkconfig.defaults` targets **ESP32-C6**. For ESP32-C3 SuperMini (4 MB flash), `scripts/build.sh` handles target, flash size and partition table:
+```bash
+scripts/build.sh c6      # or: scripts/build.sh c3
+scripts/flash.sh         # auto-detects the serial port; optional args: <port> <retry-timeout>
+```
+
+**Power note:** ESP32-C3 SuperMini boards draw a real current spike when WiFi/flash-erase kicks in. If flashing over a laptop USB port causes a reset loop or the board drops off USB, power it from a wall charger or powered hub instead.
 
 ### 3. Build Host Utilities and Target Payloads
 The `tools/` directory includes an automated build system that compiles host utilities (`openc6_loader`, `zc6_pack`) alongside bare-metal RISC-V payloads in `tools/example/*.c`:

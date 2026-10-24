@@ -1,7 +1,13 @@
 # This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
 # Espressif IoT Development Framework (ESP-IDF) 6.1.0 Project Minimal Configuration
 #
-# default:
+# This project builds for either ESP32-C6 (8 MB flash, primary target) or
+# ESP32-C3 SuperMini (4 MB flash) from the same codebase. Defaults to C6.
+#
+# To switch to ESP32-C3, see QUICKSTART-ESP32-C3.md, or in short:
+#   CONFIG_IDF_TARGET="esp32c3"
+#   CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y   (and comment out the _8MB line below)
+#   CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_c3_4mb.csv"
 CONFIG_IDF_TARGET="esp32c6"
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
@@ -21,3 +27,11 @@ CONFIG_ESP_WIFI_RX_BA_WIN=2
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=6
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=16
+
+# Brownout Detector
+# Confirmed the reset was a genuine power delivery limit (crash moved to the
+# NVS flash-erase current spike once disabled, instead of resetting cleanly).
+# Left enabled: a clean reset-and-retry is safer than a silent hang while the
+# power supply gets fixed (wall charger / powered hub instead of laptop USB).
+CONFIG_ESP_BROWNOUT_DET=y
+CONFIG_ESP_BROWNOUT_DET_LVL_SEL_7=y

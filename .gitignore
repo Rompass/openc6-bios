@@ -1,0 +1,17 @@
+# ESP-IDF build output
+build/
+sdkconfig
+sdkconfig.old
+managed_components/
+dependencies.lock
+
+# Local ESP-IDF toolchain checkout (own repo, not a submodule of this one)
+esp-idf-v6.1-beta1/
+
+# Compiled host tools / payload artifacts
+tools/build/
+tools/openc6_loader
+tools/payload.bin
+
+# macOS
+.DS_Store

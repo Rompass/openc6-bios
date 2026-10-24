@@ -1,0 +1,12 @@
+# Partition table for ESP32-C3 SuperMini (4 MB / 0x400000)
+# NOTE: Use with CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y in sdkconfig.defaults
+# App partitions must be aligned to 0x10000 (64 KB)
+#
+# Name,   Type,  SubType,    Offset,   Size,     Flags
+nvs,      data,  nvs,        0x9000,   0x5000,
+otadata,  data,  ota,        0xe000,   0x2000,
+phy_init, data,  phy,        0x10000,  0x1000,
+bios_fw,  app,   factory,    0x20000,  0x120000,
+ota_0,    app,   ota_0,      0x140000, 0x120000,
+openc6_fs, data, 0xff,       0x260000, 0x120000,
+payload_xip, data, 0x20,     0x380000, 0x80000,
