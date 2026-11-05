@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#define FLASH_SECTOR_SIZE 4096
 #define FLASH_SIZE   (1024 * 1024)
 
 void flash_read(uint32_t addr, uint8_t *buf, size_t size);

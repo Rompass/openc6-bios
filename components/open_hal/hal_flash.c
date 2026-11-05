@@ -1,5 +1,4 @@
 #include "hal_flash.h"
-#include "openc6_fs.h"
 #include "esp_partition.h"
 #include "esp_log.h"
 #include "hw_usb.h"
@@ -24,7 +23,7 @@ void hal_flash_init(void) {
         ESP_LOGI(TAG, "Partition 'openc6_fs' located: 0x%08lX, Size: %lu KB (%lu sectors)",
                  (unsigned long)s_fs_partition->address,
                  (unsigned long)(s_fs_partition->size / 1024),
-                 (unsigned long)(s_fs_partition->size / SECTOR_SIZE));
+                 (unsigned long)(s_fs_partition->size / FLASH_SECTOR_SIZE));
     }
 }
 
@@ -55,7 +54,7 @@ void flash_erase_sector(uint32_t sector_num) {
         hw_usb_print("[HAL_ERR] s_fs_partition is NULL!\r\n");
         return;
     }
-    esp_err_t err = esp_partition_erase_range(s_fs_partition, sector_num * SECTOR_SIZE, SECTOR_SIZE);
+    esp_err_t err = esp_partition_erase_range(s_fs_partition, sector_num * FLASH_SECTOR_SIZE, FLASH_SECTOR_SIZE);
     if (err != ESP_OK) {
         dbg_usb_printf("[HAL_ERR] Sector %lu erase failed: 0x%x\r\n",
                        (unsigned long)sector_num, (unsigned int)err);

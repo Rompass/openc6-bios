@@ -1,3 +1,3 @@
-idf_component_register(SRCS "openc6_fs.c" "hal_flash.c"
+idf_component_register(SRCS "openc6_fs.c"
                        INCLUDE_DIRS "include"
                        PRIV_REQUIRES spi_flash esp_partition sandbox wifi_mgmt management_engine open_hal)
