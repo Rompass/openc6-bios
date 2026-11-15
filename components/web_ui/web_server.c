@@ -2,15 +2,16 @@
 #include <esp_log.h>
 #include <esp_system.h>
 #include <esp_partition.h>
-#include <esp_flash.h>
+#include "hal_flash.h"
+#include "management_engine.h"
 #include <esp_heap_caps.h>
-#include <esp_rom_sys.h>
 #include <nvs.h>
 #include "cJSON.h"
 #include "nvram.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "me_shared.h"
+#include "hal_clock.h"
 
 static const char *TAG = "WEB_UI";
 
@@ -35,8 +36,8 @@ static esp_err_t sysinfo_get_handler(httpd_req_t *req)
     cJSON *root = cJSON_CreateObject();
 
     /* 1. Flash storage boundary audit */
-    uint32_t flash_size = 0;
-    if (esp_flash_get_size(NULL, &flash_size) == ESP_OK) {
+    uint32_t flash_size = hal_flash_get_chip_size();
+    if (flash_size > 0) {
         cJSON_AddNumberToObject(root, "flash_total_mb", flash_size / (1024 * 1024));
     }
 
@@ -47,8 +48,8 @@ static esp_err_t sysinfo_get_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "ram_free_kb", ram_free / 1024);
 
     /* 3. Real-time CPU frequency (derived from PLL ticks) and ULP ME die temperature */
-    cJSON_AddNumberToObject(root, "cpu_real_mhz", esp_rom_get_cpu_ticks_per_us());
-    cJSON_AddNumberToObject(root, "cpu_temp_c", ulp_me_temperature);
+    cJSON_AddNumberToObject(root, "cpu_real_mhz", hal_clock_get_cpu_mhz());
+    cJSON_AddNumberToObject(root, "cpu_temp_c", management_engine_is_active() ? ulp_me_temperature : 0);
 
     /* 4. Complete flash partition layout discovery */
     cJSON *parts = cJSON_AddArrayToObject(root, "partitions");

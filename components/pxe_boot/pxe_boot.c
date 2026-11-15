@@ -12,6 +12,7 @@
 #include "openc6_fs.h"
 #include "hal_flash.h"
 #include "hw_usb.h"
+#include "proc_manager.h"
 
 static const char *TAG = "PXE_BOOT";
 
@@ -68,10 +69,7 @@ bool pxe_boot_execute(const char* url)
     snprintf(log_msg, sizeof(log_msg), "[PXE] Normalized URL: %s\r\n", full_url);
     hw_usb_print(log_msg);
 
-    uint8_t *arena = sandbox_get_arena();
-    size_t arena_size = sandbox_get_arena_size();
-
-    if (!arena || arena_size == 0) {
+    if (!sandbox_get_arena() || sandbox_get_arena_size() == 0) {
         hw_usb_print("[PXE] Error: Dynamic Sandbox arena not allocated.\r\n");
         return false;
     }
@@ -104,25 +102,30 @@ bool pxe_boot_execute(const char* url)
         return false;
     }
 
-    if ((size_t)content_length > arena_size) {
-        char sz_msg[96];
-        snprintf(sz_msg, sizeof(sz_msg), "[PXE] Error: File (%d bytes) exceeds arena capacity (%zu bytes)!\r\n",
-                 content_length, arena_size);
+    /* Allocate only free 4KB pages from pool so running background jobs are untouched */
+    uint8_t *dl_buf = (uint8_t *)proc_mempool_alloc((size_t)content_length);
+    if (!dl_buf) {
+        proc_mem_stats_t st;
+        proc_get_mem_stats(&st);
+        char sz_msg[128];
+        snprintf(sz_msg, sizeof(sz_msg),
+                 "[PXE] Error: File (%d bytes) exceeds largest free page block (%zu bytes)!\r\n",
+                 content_length, st.largest_free_block);
         hw_usb_print(sz_msg);
         esp_http_client_cleanup(client);
         return false;
     }
 
     char start_msg[96];
-    snprintf(start_msg, sizeof(start_msg), "[PXE] Streaming %d bytes into Sandbox arena...\r\n", content_length);
+    snprintf(start_msg, sizeof(start_msg), "[PXE] Streaming %d bytes into free arena pages...\r\n", content_length);
     hw_usb_print(start_msg);
 
-    /* Stream directly into pre-allocated sandbox arena memory to save task stack */
     int total_read = 0;
     while (total_read < content_length) {
-        int read_len = esp_http_client_read(client, (char *)(arena + total_read), content_length - total_read);
+        int read_len = esp_http_client_read(client, (char *)(dl_buf + total_read), content_length - total_read);
         if (read_len < 0) {
             hw_usb_print("[PXE] Error reading network stream.\r\n");
+            proc_mempool_free(dl_buf, (size_t)content_length);
             esp_http_client_cleanup(client);
             return false;
         }
@@ -146,7 +149,10 @@ bool pxe_boot_execute(const char* url)
         snprintf(save_msg, sizeof(save_msg), "[PXE] Saving '%s' to /downloaded/ (Dir %u)...\r\n", filename, target_dir_id);
         hw_usb_print(save_msg);
 
-        if (fs_write_file(filename, arena, total_read, target_dir_id) < 0) {
+        int16_t w_res = fs_write_file(filename, dl_buf, total_read, target_dir_id);
+        proc_mempool_free(dl_buf, (size_t)content_length);
+
+        if (w_res < 0) {
             hw_usb_print("[PXE] Error: File system write failed. Storage may be full.\r\n");
             return false;
         }
@@ -155,6 +161,7 @@ bool pxe_boot_execute(const char* url)
         return true;
     }
 
+    proc_mempool_free(dl_buf, (size_t)content_length);
     hw_usb_print("[PXE] Error: Download stream truncated.\r\n");
     return false;
 }

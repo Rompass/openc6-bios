@@ -1,7 +1,6 @@
 idf_component_register(
     SRCS
         "sandbox_mem.c"
-        "sandbox_pmp.c"
         "sandbox_trap.S"
         "sandbox_core.c"
     INCLUDE_DIRS
@@ -13,4 +12,5 @@ idf_component_register(
         management_engine
         led_mgmt
         open_hal
+        openc6_fs
 )

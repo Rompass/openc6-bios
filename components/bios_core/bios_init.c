@@ -3,21 +3,15 @@
 #include <stdarg.h>
 #include <math.h>
 #include "esp_log.h"
-#include "esp_sleep.h"
 #include "esp_system.h"
-#include "esp_partition.h"
-#include "esp_timer.h"
-#include "driver/gpio.h"
-#include "rom/ets_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_ota_ops.h"
 #include "esp_flash.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
-#include "soc/soc.h"
-#include "soc/wdev_reg.h"
-#include "driver/rtc_io.h"
+#include "hal_power.h"
+#include "hal_flash.h"
 
 #include "bios_core.h"
 #include "hw_usb.h"
@@ -34,18 +28,10 @@
 #include "openc6_fs.h"
 #include "hal_flash.h"
 #include "openc6_syscall.h"
+#include "hal_cpu.h"
 
 #define BIOS_AP_SSID    "BIOS_SETUP_C6"
-#define PIN_BTN_GND     3
-#define PIN_BTN_SENSE   4
-#define PIN_BTN_BOOT    9
-
 static const char *TAG = "BIOS_CORE";
-
-/* Shared atomic spinlock guarding bare-metal USB-Serial-JTAG endpoint FIFOs */
-volatile uint32_t g_hw_usb_lock = 0;
-/* Active console telemetry tap hook for c6wsh web socket/chunked stream */
-volatile hw_usb_tap_fn_t g_hw_usb_tap = NULL;
 
 bool is_me_enabled = true;
 
@@ -90,17 +76,17 @@ extern void __real_esp_restart_noos(void);
 void __wrap_esp_restart_noos(void)
 {
     uint32_t mcause = 0;
-    asm volatile ("csrr %0, 0x342" : "=r"(mcause));
+    hal_cpu_read_mcause();
 
     /* Check if this is an actual CPU hardware exception (bit 31 is 0 and cause is non-zero) */
     bool is_genuine_crash = ((mcause & (1UL << 31)) == 0) && (mcause != 0);
 
     if (is_genuine_crash) {
         uint32_t mepc = 0, mtval = 0, ra = 0, sp = 0;
-        asm volatile ("csrr %0, 0x341" : "=r"(mepc));
-        asm volatile ("csrr %0, 0x343" : "=r"(mtval));
-        asm volatile ("mv %0, ra" : "=r"(ra));
-        asm volatile ("mv %0, sp" : "=r"(sp));
+        hal_cpu_read_mepc();
+        hal_cpu_read_mtval();
+        hal_cpu_read_ra();
+        hal_cpu_read_sp();
 
         hw_usb_print("\r\n======================================================================\r\n");
         hw_usb_print("[CRASH_INTERCEPTED] CPU Exception trapped before reboot!\r\n");
@@ -384,22 +370,48 @@ static uint32_t bios_get_total_flash(void)
 
 static void abi_fs_write_file(const char *name, const uint8_t *data, uint32_t len, uint32_t parent_id, uint8_t force)
 {
-    fs_write_file(name, data, len, (uint16_t)parent_id);
+    register uint32_t a7 asm("a7") = SYS_FS_WRITE_FILE;
+    register uint32_t a0 asm("a0") = (uint32_t)name;
+    register uint32_t a1 asm("a1") = (uint32_t)data;
+    register uint32_t a2 asm("a2") = len;
+    register uint32_t a3 asm("a3") = parent_id;
+    register uint32_t a4 asm("a4") = (uint32_t)force;
+    asm volatile (
+        "ecall"
+        : "+r"(a0)
+        : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+        : "memory"
+    );
 }
 
 static int32_t abi_fs_read_file(const char *name, uint8_t *dest, uint32_t offset, uint32_t len, uint32_t parent_id)
 {
-    int16_t id = fs_find_id(name, (uint16_t)parent_id);
-    if (id < 0) return -1;
-    return fs_read_file((uint16_t)id, dest, offset, len);
+    register uint32_t a7 asm("a7") = SYS_FS_READ_FILE;
+    register uint32_t a0 asm("a0") = (uint32_t)name;
+    register uint32_t a1 asm("a1") = (uint32_t)dest;
+    register uint32_t a2 asm("a2") = offset;
+    register uint32_t a3 asm("a3") = len;
+    register uint32_t a4 asm("a4") = parent_id;
+    asm volatile (
+        "ecall"
+        : "+r"(a0)
+        : "r"(a1), "r"(a2), "r"(a3), "r"(a4), "r"(a7)
+        : "memory"
+    );
+    return (int32_t)a0;
 }
 
 static void abi_fs_delete(const char *name, uint32_t parent_id)
 {
-    int16_t id = fs_find_id(name, (uint16_t)parent_id);
-    if (id >= 0) {
-        fs_delete((uint16_t)id);
-    }
+    register uint32_t a7 asm("a7") = SYS_FS_DELETE;
+    register uint32_t a0 asm("a0") = (uint32_t)name;
+    register uint32_t a1 asm("a1") = parent_id;
+    asm volatile (
+        "ecall"
+        : "+r"(a0)
+        : "r"(a1), "r"(a7)
+        : "memory"
+    );
 }
 
 /**
@@ -568,27 +580,14 @@ void bios_enter_s5_state(void)
     wifi_mgmt_disconnect();
     esp_wifi_stop();
 
-    /* PIN 3: Virtual ground locked to 0V across deep sleep */
-    gpio_reset_pin((gpio_num_t)PIN_BTN_GND);
-    gpio_set_direction((gpio_num_t)PIN_BTN_GND, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_BTN_GND, 0);
-    gpio_hold_en((gpio_num_t)PIN_BTN_GND);
-
-    /* PIN 4: Sense input with pullup enabled */
-    gpio_reset_pin((gpio_num_t)PIN_BTN_SENSE);
-    gpio_set_direction((gpio_num_t)PIN_BTN_SENSE, GPIO_MODE_INPUT);
-    gpio_set_pull_mode((gpio_num_t)PIN_BTN_SENSE, GPIO_PULLUP_ONLY);
-
-    /* Hardware wakeup trigger via EXT1 on active-low sense line */
-    esp_sleep_enable_ext1_wakeup(1ULL << PIN_BTN_SENSE, ESP_EXT1_WAKEUP_ANY_LOW);
-
-    if (is_me_enabled) {
+    bool wake_ulp = false;
+    if (is_me_enabled && management_engine_is_active()) {
         ESP_LOGI(TAG, "S5: Power Off. Management Engine running in background.");
         ulp_me_hp_is_awake = 0;
-        esp_sleep_enable_ulp_wakeup();
+        wake_ulp = true;
     }
 
-    esp_deep_sleep_start();
+    hal_power_enter_s5(wake_ulp);
 }
 
 /**
@@ -602,36 +601,11 @@ void bios_core_start(void)
     hw_usb_init();
     esp_log_set_vprintf(bios_vprintf);
 
-    esp_reset_reason_t rst_reason = esp_reset_reason();
-    bool is_cold_boot = (rst_reason != ESP_RST_DEEPSLEEP);
-    uint32_t legacy_hold_ms = 0;
+    int rst_reason = hal_power_get_reset_reason();
+    bool is_cold_boot = hal_power_is_cold_boot();
+    uint32_t legacy_hold_ms = hal_power_measure_wake_hold_ms();
 
-    /* Measure physical power button press duration upon wakeup from S5 deep sleep */
-    if (!is_cold_boot && (esp_sleep_get_wakeup_causes() & (1ULL << ESP_SLEEP_WAKEUP_EXT1))) {
-        gpio_reset_pin((gpio_num_t)PIN_BTN_GND);
-        gpio_set_direction((gpio_num_t)PIN_BTN_GND, GPIO_MODE_OUTPUT);
-        gpio_set_level((gpio_num_t)PIN_BTN_GND, 0);
-
-        gpio_reset_pin((gpio_num_t)PIN_BTN_SENSE);
-        gpio_set_direction((gpio_num_t)PIN_BTN_SENSE, GPIO_MODE_INPUT);
-        gpio_set_pull_mode((gpio_num_t)PIN_BTN_SENSE, GPIO_PULLUP_ONLY);
-
-        while (gpio_get_level((gpio_num_t)PIN_BTN_SENSE) == 0 && legacy_hold_ms < 3000) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            legacy_hold_ms += 10;
-        }
-    }
-
-    /* Release hold latches and lock PIN 3 as strong 0V GND during runtime */
-    gpio_hold_dis((gpio_num_t)PIN_BTN_GND);
-    gpio_reset_pin((gpio_num_t)PIN_BTN_GND);
-    gpio_set_direction((gpio_num_t)PIN_BTN_GND, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_BTN_GND, 0);
-
-    /* Enforce internal pullup on sense line */
-    gpio_reset_pin((gpio_num_t)PIN_BTN_SENSE);
-    gpio_set_direction((gpio_num_t)PIN_BTN_SENSE, GPIO_MODE_INPUT);
-    gpio_set_pull_mode((gpio_num_t)PIN_BTN_SENSE, GPIO_PULLUP_ONLY);
+    hal_power_init_runtime_pins();
 
     uint32_t me_reason = management_engine_get_boot_reason();
     management_engine_clear_boot_reason();
@@ -639,7 +613,7 @@ void bios_core_start(void)
     char boot_info[160];
     snprintf(boot_info, sizeof(boot_info),
              "--- OpenC6 BIOS v2.0-ME Initializing (ME Reason: 0x%08lx, RST Reason: %d) ---\r\n",
-             (unsigned long)me_reason, (int)rst_reason);
+             (unsigned long)me_reason, rst_reason);
     hw_usb_print(boot_info);
 
     nvram_init();
@@ -648,14 +622,12 @@ void bios_core_start(void)
     hal_flash_init();
     fs_init();
 
-    gpio_reset_pin((gpio_num_t)PIN_BTN_BOOT);
-    gpio_set_direction((gpio_num_t)PIN_BTN_BOOT, GPIO_MODE_INPUT);
-    gpio_set_pull_mode((gpio_num_t)PIN_BTN_BOOT, GPIO_PULLUP_ONLY);
-
     /* Launch Management Engine co-processor on LP-Core to supervise host watchdog and thermals */
-    is_me_enabled = true;
-    management_engine_init(true, is_cold_boot);
-    ulp_me_hp_is_awake = 1;
+    is_me_enabled = (HAL_CAP_LP_CORE != 0);
+    management_engine_init(is_me_enabled, is_cold_boot);
+    if (management_engine_is_active()) {
+        ulp_me_hp_is_awake = 1;
+    }
 
     bios_update_state_t ota_state;
     nvram_get_bios_update_state(&ota_state);
@@ -672,7 +644,7 @@ void bios_core_start(void)
             if (pxe_bios_ota_execute(pxe_url)) {
                 led_mgmt_set_color(0, 255, 0);
                 vTaskDelay(pdMS_TO_TICKS(1000));
-                esp_restart();
+                hal_power_reboot();
             } else {
                 led_mgmt_set_color(255, 0, 0);
                 vTaskDelay(pdMS_TO_TICKS(2000));
@@ -680,25 +652,14 @@ void bios_core_start(void)
         }
     }
 
-    gpio_reset_pin((gpio_num_t)PIN_CMOS_GND);
-    gpio_set_direction((gpio_num_t)PIN_CMOS_GND, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PIN_CMOS_GND, 0);
-
-    gpio_reset_pin((gpio_num_t)PIN_CLEAR_NVRAM);
-    gpio_set_direction((gpio_num_t)PIN_CLEAR_NVRAM, GPIO_MODE_INPUT);
-    gpio_set_pull_mode((gpio_num_t)PIN_CLEAR_NVRAM, GPIO_PULLUP_ONLY);
-
-    vTaskDelay(pdMS_TO_TICKS(10));
-
     /* Hardware CMOS Clear jumper check: revert NVRAM to baseline schema defaults */
-    if (gpio_get_level((gpio_num_t)PIN_CLEAR_NVRAM) == 0) {
+    if (hal_power_check_clear_cmos_jumper()) {
         led_mgmt_set_aura_mode(AURA_DISABLED);
         led_mgmt_set_color(COLOR_POST_ERROR);
         nvram_load_defaults();
         vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_restart();
+        hal_power_reboot();
     }
-    gpio_set_direction((gpio_num_t)PIN_CMOS_GND, GPIO_MODE_DISABLE);
 
     power_tweaker_apply_bios_settings();
     led_mgmt_blink_post(COLOR_POST_OK, 3);
@@ -718,9 +679,9 @@ void bios_core_start(void)
     bool enter_setup = false;
 
     /* Interactive boot menu triggered by physical BOOT pin hold */
-    if (gpio_get_level((gpio_num_t)PIN_BTN_BOOT) == 0) {
+    if (hal_power_is_boot_btn_pressed()) {
         uint32_t hold_time = 0;
-        while (gpio_get_level((gpio_num_t)PIN_BTN_BOOT) == 0 && hold_time < 1000) {
+        while (hal_power_is_boot_btn_pressed() && hold_time < 1000) {
             vTaskDelay(pdMS_TO_TICKS(10));
             hold_time += 10;
         }
@@ -750,10 +711,10 @@ void bios_core_start(void)
     } else if (me_reason == ME_BOOT_REASON_WDT) {
         hw_usb_print("\r\n[WATCHDOG_RECOVERY] Kernel lockup detected! System was reset by LP-Core Management Engine (15s timeout).\r\n");
         enter_shell = true;
-    } else if (rst_reason == ESP_RST_PANIC) {
+    } else if (hal_power_is_panic_reset()) {
         hw_usb_print("\r\n[KERNEL_RECOVERY] System recovered from CPU Exception / Panic. Launching Shell.\r\n");
         enter_shell = true;
-    } else if (me_reason == ME_BOOT_REASON_NORMAL || legacy_hold_ms > 0 || rst_reason == ESP_RST_SW || rst_reason == ESP_RST_DEEPSLEEP) {
+    } else if (me_reason == ME_BOOT_REASON_NORMAL || legacy_hold_ms > 0 || hal_power_is_sw_or_sleep_reset()) {
         direct_flash_boot = true;
     } else if (is_cold_boot) {
         dc_loss_action_t dc_action;
@@ -871,8 +832,7 @@ void bios_core_start(void)
     /* Standard payload launch path: executed exclusively in U-Mode under PMP hardware isolation */
     if (direct_flash_boot) {
         direct_flash_boot = false;
-        const esp_partition_t *part = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, 0xff, "openc6_fs");
-        if (part) {
+        if (hal_flash_is_ready()) {
             uint16_t boot_dir_id = 0;
             int16_t dir_id = fs_find_id("downloaded", 0);
             if (dir_id >= 0 && fs_get_type(dir_id) == TYPE_DIR) {

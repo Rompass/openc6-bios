@@ -4,6 +4,11 @@
 #include "hw_usb.h"
 #include "management_engine.h"
 #include "hal_gpio.h"
+#include "hal_pmp.h"
+#include "hal_cpu.h"
+#include "hal_wdt.h"
+#include "hal_rng.h"
+#include "hal_timer.h"
 #include <stdio.h>
 #include <string.h>
 #include <setjmp.h>
@@ -14,38 +19,11 @@
 #include "esp_heap_caps.h"
 #include "esp_task_wdt.h"
 #include "led_mgmt.h"
-#include "esp_timer.h"
-#include "rom/ets_sys.h"
 #include "lwip/sockets.h"
 #include "esp_netif.h"
-#include "soc/soc.h"
-#include "soc/wdev_reg.h"
-#include "esp_flash.h"
+#include "hal_flash.h"
+#include "openc6_fs.h"
 #include <math.h>
-
-/* RISC-V Privileged Architecture v1.12: Machine-Mode Control and Status Registers */
-#define CSR_MSTATUS              0x300
-#define CSR_MIE                  0x304
-#define CSR_MTVEC                0x305
-#define CSR_MSCRATCH             0x340
-#define CSR_MEPC                 0x341
-
-/* ESP32-C6 TRM Rev 1.2: Timer Group Watchdog registers */
-#define TIMG0_WDTCONFIG0_REG     ((volatile uint32_t *)0x60008048)
-#define TIMG0_WDTFEED_REG        ((volatile uint32_t *)0x60008060)
-#define TIMG0_WDTWPROTECT_REG    ((volatile uint32_t *)0x60008064)
-
-#define TIMG1_WDTCONFIG0_REG     ((volatile uint32_t *)0x60009048)
-#define TIMG1_WDTFEED_REG        ((volatile uint32_t *)0x60009060)
-#define TIMG1_WDTWPROTECT_REG    ((volatile uint32_t *)0x60009064)
-
-/* ESP-IDF Linker symbols for RISC-V base registers */
-extern int __global_pointer$;
-
-/* ESP32-C6 TRM Rev 1.2: Timer Group Interrupt Clear registers */
-#define TIMG0_INT_CLR_REG        ((volatile uint32_t *)0x60008078)
-#define TIMG1_INT_CLR_REG        ((volatile uint32_t *)0x60009078)
-#define TIMG_WDT_INT_CLR_BIT     (1UL << 1)
 
 #define SANDBOX_BLOCK_MAGIC      0x53424D4FUL
 
@@ -61,7 +39,6 @@ static const char *TAG = "SANDBOX";
 extern uint8_t *g_sandbox_arena;
 extern size_t g_sandbox_arena_size;
 
-void sandbox_pmp_setup(uintptr_t arena_start, uintptr_t arena_end);
 extern void sandbox_vector_table(void);
 extern void sandbox_trap_vector(void);
 
@@ -158,8 +135,6 @@ static sandbox_status_t g_exit_status = SANDBOX_STATUS_OK;
 static uint32_t g_saved_mtvec = 0;
 static uint32_t g_saved_mie = 0;
 static uint32_t g_saved_mscratch = 0;
-static uint32_t g_saved_timg0_wdt_cfg = 0;
-static uint32_t g_saved_timg1_wdt_cfg = 0;
 static bool s_sandbox_active = false;
 
 static const openc6_abi_t *g_abi = NULL;
@@ -177,34 +152,6 @@ static void trap_print_hex(uint32_t val)
     }
     buf[10] = '\0';
     hw_usb_print(buf);
-}
-
-static inline void sandbox_wdt_disable(void)
-{
-    *TIMG0_WDTWPROTECT_REG = 0x50D83AA1;
-    g_saved_timg0_wdt_cfg = *TIMG0_WDTCONFIG0_REG;
-    *TIMG0_WDTCONFIG0_REG = 0;
-    *TIMG0_WDTFEED_REG = 1;
-    *TIMG0_WDTWPROTECT_REG = 0;
-
-    *TIMG1_WDTWPROTECT_REG = 0x50D83AA1;
-    g_saved_timg1_wdt_cfg = *TIMG1_WDTCONFIG0_REG;
-    *TIMG1_WDTCONFIG0_REG = 0;
-    *TIMG1_WDTFEED_REG = 1;
-    *TIMG1_WDTWPROTECT_REG = 0;
-}
-
-static inline void sandbox_wdt_restore(void)
-{
-    *TIMG0_WDTWPROTECT_REG = 0x50D83AA1;
-    *TIMG0_WDTFEED_REG = 1;
-    *TIMG0_WDTCONFIG0_REG = g_saved_timg0_wdt_cfg;
-    *TIMG0_WDTWPROTECT_REG = 0;
-
-    *TIMG1_WDTWPROTECT_REG = 0x50D83AA1;
-    *TIMG1_WDTFEED_REG = 1;
-    *TIMG1_WDTCONFIG0_REG = g_saved_timg1_wdt_cfg;
-    *TIMG1_WDTWPROTECT_REG = 0;
 }
 
 /**
@@ -268,24 +215,12 @@ void sandbox_unregister_task_external(TaskHandle_t task)
                 s_active_sandboxes = 0;
 
                 /* Restore host FreeRTOS hardware execution environment */
-                asm volatile ("csrw mscratch, %0" : : "r"(g_saved_mscratch));
-                asm volatile ("csrw mtvec, %0" : : "r"(g_saved_mtvec));
-                asm volatile ("csrw mie, %0" : : "r"(g_saved_mie));
-
-                asm volatile (
-                    ".option push\n"
-                    ".option norelax\n"
-                    "la gp, __global_pointer$\n"
-                    ".option pop\n"
-                    : : : "gp"
-                );
-
-                uint32_t mstatus_val;
-                asm volatile ("csrr %0, mstatus" : "=r"(mstatus_val));
-                mstatus_val |= (3UL << 11);
-                asm volatile ("csrw mstatus, %0" : : "r"(mstatus_val));
-
-                sandbox_wdt_restore();
+                hal_cpu_write_mscratch(g_saved_mscratch);
+                hal_cpu_write_mtvec(g_saved_mtvec);
+                hal_cpu_write_mie(g_saved_mie);
+                hal_cpu_restore_gp();
+                hal_cpu_force_mmode_mpp();
+                hal_wdt_timg_restore();
                 s_sandbox_active = false;
             }
             break;
@@ -417,7 +352,7 @@ bool sandbox_init_dynamic(const openc6_abi_t *abi, size_t kernel_reserve_bytes)
 
     uintptr_t start = (uintptr_t)g_sandbox_arena;
     uintptr_t end   = start + g_sandbox_arena_size;
-    sandbox_pmp_setup(start, end);
+    hal_pmp_setup(start, end);
 
     ESP_LOGI(TAG, "Dynamic Sandbox ready: %zu KB [0x%08lx - 0x%08lx] (Reserve: %zu KB)",
              alloc_size / 1024, (unsigned long)start, (unsigned long)end, kernel_reserve_bytes / 1024);
@@ -427,7 +362,7 @@ bool sandbox_init_dynamic(const openc6_abi_t *abi, size_t kernel_reserve_bytes)
 void sandbox_deinit(void)
 {
     if (g_sandbox_arena) {
-        sandbox_pmp_setup(0, 0);
+        hal_pmp_clear();
         free(g_sandbox_arena);
         g_sandbox_arena = NULL;
         g_sandbox_arena_size = 0;
@@ -546,6 +481,41 @@ static void sandbox_print_exception_dump(sandbox_trap_frame_t *frame, uint32_t c
     hw_usb_print("\r\n======================================================================\r\n\r\n");
 }
 
+static bool sandbox_is_valid_read_addr(uintptr_t addr, size_t len)
+{
+    uintptr_t a_start = (uintptr_t)g_sandbox_arena;
+    uintptr_t a_end   = a_start + g_sandbox_arena_size;
+    bool in_arena = (addr >= a_start && addr <= a_end && len <= (a_end - addr));
+    bool in_flash = hal_cpu_is_rodata_range(addr, len);
+    return in_arena || in_flash;
+}
+
+static bool sandbox_is_valid_write_addr(uintptr_t addr, size_t len)
+{
+    uintptr_t a_start = (uintptr_t)g_sandbox_arena;
+    uintptr_t a_end   = a_start + g_sandbox_arena_size;
+    return (addr >= a_start && addr <= a_end && len <= (a_end - addr));
+}
+
+static bool sandbox_copy_user_str(uintptr_t user_ptr, char *dst, size_t max_len)
+{
+    if (user_ptr == 0 || max_len == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < max_len; i++) {
+        if (!sandbox_is_valid_read_addr(user_ptr + i, 1)) {
+            return false;
+        }
+        char c = ((const char *)user_ptr)[i];
+        dst[i] = c;
+        if (c == '\0') {
+            return i > 0;
+        }
+    }
+    dst[max_len - 1] = '\0';
+    return true;
+}
+
 int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t mtval)
 {
     bool is_interrupt = (mcause & (1UL << 31)) != 0;
@@ -558,10 +528,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
 
     /* Force Machine Mode (MPP = 3) during C trap handler execution so ESP-IDF spinlocks
      * never attempt to touch the non-existent 'ustatus' CSR on ESP32-C6 silicon! */
-    uint32_t mstatus_trap;
-    asm volatile ("csrr %0, mstatus" : "=r"(mstatus_trap));
-    mstatus_trap |= (3UL << 11);
-    asm volatile ("csrw mstatus, %0" : : "r"(mstatus_trap));
+    hal_cpu_force_mmode_mpp();
 
     #if SANDBOX_DEBUG_TRAPS
     hw_usb_print("[TRAP_DISPATCH] Trap entered! Cause=");
@@ -583,7 +550,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
         uint32_t sys_id = frame->a7;
 
         /* Enable interrupts during syscall execution so lwIP tcpip_thread can service sockets */
-        asm volatile ("csrs mstatus, 8");
+        hal_cpu_irq_enable();
 
         switch (sys_id) {
             case SYS_EXIT: {
@@ -603,7 +570,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                 uintptr_t a_start = (uintptr_t)g_sandbox_arena;
                 uintptr_t a_end   = a_start + g_sandbox_arena_size;
                 if ((str_addr >= a_start && str_addr < a_end) ||
-                    (str_addr >= SOC_IROM_LOW && str_addr < SOC_IROM_HIGH)) {
+                    hal_cpu_is_rodata_addr(str_addr)) {
                     hw_usb_print((const char *)str_addr);
                     }
                     frame->a0 = 0;
@@ -611,12 +578,13 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
             }
 
             case SYS_DELAY_MS: {
+                management_engine_pet_watchdog();
                 uint32_t ms = (uint32_t)frame->a0;
                 if (ms >= portTICK_PERIOD_MS) {
                     vTaskDelay(pdMS_TO_TICKS(ms));
                 } else if (ms > 0) {
                     while (ms--) {
-                        ets_delay_us(1000);
+                        hal_timer_delay_us(1000);
                     }
                 }
                 frame->a0 = 0;
@@ -641,7 +609,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
             }
 
             case SYS_GET_RANDOM:
-                frame->a0 = REG_READ(WDEV_RND_REG);
+                frame->a0 = hal_rng_get_u32();
                 break;
 
             case SYS_GET_FREE_RAM:
@@ -652,15 +620,9 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                 frame->a0 = heap_caps_get_total_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
                 break;
 
-            case SYS_GET_TOTAL_FLASH: {
-                uint32_t flash_sz = 0;
-                if (esp_flash_get_size(NULL, &flash_sz) == ESP_OK) {
-                    frame->a0 = flash_sz;
-                } else {
-                    frame->a0 = 0;
-                }
+            case SYS_GET_TOTAL_FLASH:
+                frame->a0 = hal_flash_get_chip_size();
                 break;
-            }
 
             case SYS_MALLOC:
                 frame->a0 = (uint32_t)sandbox_alloc((uint32_t)frame->a0);
@@ -783,6 +745,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
             }
 
             case SYS_TCP_ACCEPT: {
+                management_engine_pet_watchdog();
                 int s = (int)frame->a0;
                 uint32_t timeout_ms = frame->a1;
 
@@ -813,6 +776,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                 }
                 break;
             }
+
             case SYS_TCP_READ: {
                 int fd = (int)frame->a0;
                 uintptr_t buf_addr = (uintptr_t)frame->a1;
@@ -837,7 +801,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                 uintptr_t a_end   = a_start + g_sandbox_arena_size;
 
                 bool in_arena = (buf_addr >= a_start && (buf_addr + len) <= a_end);
-                bool in_flash = (buf_addr >= SOC_IROM_LOW && (buf_addr + len) <= SOC_IROM_HIGH);
+                bool in_flash = hal_cpu_is_rodata_range(buf_addr, len);
 
                 if (in_arena || in_flash) {
                     ssize_t w = send(fd, (const void *)buf_addr, len, 0);
@@ -861,7 +825,7 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                         }
                     }
                     shutdown(fd, SHUT_WR);
-                    ets_delay_us(30000);
+                    hal_timer_delay_us(30000);
                     close(fd);
                 }
                 frame->a0 = 0;
@@ -903,6 +867,74 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
                 }
                 break;
             }
+
+            case SYS_FS_WRITE_FILE: {
+                uintptr_t name_addr = (uintptr_t)frame->a0;
+                uintptr_t data_addr = (uintptr_t)frame->a1;
+                uint32_t len        = frame->a2;
+                uint16_t parent_id  = (uint16_t)frame->a3;
+                (void)frame->a4; /* force */
+
+                char safe_name[18];
+                if (!sandbox_copy_user_str(name_addr, safe_name, sizeof(safe_name))) {
+                    frame->a0 = (uint32_t)-1;
+                    break;
+                }
+                if (len > 0 && !sandbox_is_valid_read_addr(data_addr, len)) {
+                    frame->a0 = (uint32_t)-1;
+                    break;
+                }
+
+                int16_t id = fs_write_file(safe_name, (const uint8_t *)data_addr, len, parent_id);
+                frame->a0 = (id >= 0) ? (uint32_t)id : (uint32_t)-1;
+                break;
+            }
+
+            case SYS_FS_READ_FILE: {
+                uintptr_t name_addr = (uintptr_t)frame->a0;
+                uintptr_t dest_addr = (uintptr_t)frame->a1;
+                uint32_t offset     = frame->a2;
+                uint32_t len        = frame->a3;
+                uint16_t parent_id  = (uint16_t)frame->a4;
+
+                char safe_name[18];
+                if (!sandbox_copy_user_str(name_addr, safe_name, sizeof(safe_name))) {
+                    frame->a0 = (uint32_t)-1;
+                    break;
+                }
+                if (len == 0) {
+                    frame->a0 = 0;
+                    break;
+                }
+                if (!sandbox_is_valid_write_addr(dest_addr, len)) {
+                    frame->a0 = (uint32_t)-1;
+                    break;
+                }
+
+                int16_t id = fs_find_id(safe_name, parent_id);
+                if (id < 0) {
+                    frame->a0 = (uint32_t)-1;
+                    break;
+                }
+                frame->a0 = (uint32_t)fs_read_file((uint16_t)id, (uint8_t *)dest_addr, offset, len);
+                break;
+            }
+
+            case SYS_FS_DELETE: {
+                uintptr_t name_addr = (uintptr_t)frame->a0;
+                uint16_t parent_id  = (uint16_t)frame->a1;
+
+                char safe_name[18];
+                if (sandbox_copy_user_str(name_addr, safe_name, sizeof(safe_name))) {
+                    int16_t id = fs_find_id(safe_name, parent_id);
+                    if (id >= 0) {
+                        fs_delete((uint16_t)id);
+                    }
+                }
+                frame->a0 = 0;
+                break;
+            }
+
             case SYS_GPIO_SET_DIR:
                 frame->a0 = (uint32_t)hal_gpio_set_direction((uint32_t)frame->a0, (uint32_t)frame->a1);
                 break;
@@ -922,17 +954,10 @@ int sandbox_dispatch_trap(sandbox_trap_frame_t *frame, uint32_t mcause, uint32_t
         }
 
         /* Disarm interrupts before returning context to mret */
-        asm volatile ("csrc mstatus, 8");
+        hal_cpu_irq_disable_only();
 
         /* Restore privilege mode: return to U-mode only for U-mode ecall (code 8); preserve M-mode for kernel yields */
-        asm volatile ("csrr %0, mstatus" : "=r"(mstatus_trap));
-        if (code == 8) {
-            mstatus_trap &= ~(3UL << 11); /* Target: User Mode (U-Mode) */
-        } else {
-            mstatus_trap |= (3UL << 11);  /* Target: Machine Mode (DO NOT DEMOTE KERNEL/FREERTOS!) */
-        }
-        mstatus_trap |= (1UL << 7);       /* MPIE = 1 */
-        asm volatile ("csrw mstatus, %0" : : "r"(mstatus_trap));
+        hal_cpu_set_mret_mode(code == 8);
         return 0;
     }
 
@@ -982,47 +1007,24 @@ sandbox_status_t sandbox_run_slot(uintptr_t entry, uintptr_t user_sp, size_t bin
     }
 
     if (setjmp(task_exit_jmp) != 0) {
-        *TIMG0_WDTWPROTECT_REG = 0x50D83AA1;
-        *TIMG0_INT_CLR_REG = TIMG_WDT_INT_CLR_BIT;
-        *TIMG0_WDTFEED_REG = 1;
-        *TIMG0_WDTCONFIG0_REG = 0;
-        *TIMG0_WDTWPROTECT_REG = 0;
-
-        *TIMG1_WDTWPROTECT_REG = 0x50D83AA1;
-        *TIMG1_INT_CLR_REG = TIMG_WDT_INT_CLR_BIT;
-        *TIMG1_WDTFEED_REG = 1;
-        *TIMG1_WDTCONFIG0_REG = 0;
-        *TIMG1_WDTWPROTECT_REG = 0;
-
-        asm volatile ("csrw mip, zero");
+        hal_wdt_timg_clear_and_halt();
+        hal_cpu_clear_mip();
 
         portENTER_CRITICAL(&s_sandbox_lock);
         s_active_sandboxes--;
         if (s_active_sandboxes <= 0) {
             s_active_sandboxes = 0;
-            asm volatile ("csrw mscratch, %0" : : "r"(g_saved_mscratch));
-            asm volatile ("csrw mtvec, %0" : : "r"(g_saved_mtvec));
-            asm volatile ("csrw mie, %0" : : "r"(g_saved_mie));
-
-            asm volatile (
-                ".option push\n"
-                ".option norelax\n"
-                "la gp, __global_pointer$\n"
-                ".option pop\n"
-                : : : "gp"
-            );
-
-            uint32_t mstatus_val;
-            asm volatile ("csrr %0, mstatus" : "=r"(mstatus_val));
-            mstatus_val |= (3UL << 11);
-            asm volatile ("csrw mstatus, %0" : : "r"(mstatus_val));
-
-            sandbox_wdt_restore();
+            hal_cpu_write_mscratch(g_saved_mscratch);
+            hal_cpu_write_mtvec(g_saved_mtvec);
+            hal_cpu_write_mie(g_saved_mie);
+            hal_cpu_restore_gp();
+            hal_cpu_force_mmode_mpp();
+            hal_wdt_timg_restore();
             s_sandbox_active = false;
         }
         portEXIT_CRITICAL(&s_sandbox_lock);
 
-        asm volatile ("csrs mstatus, 8");
+        hal_cpu_irq_enable();
         sandbox_status_t final_status = st->exit_status;
         sandbox_unregister_task(self);
         return final_status;
@@ -1030,35 +1032,18 @@ sandbox_status_t sandbox_run_slot(uintptr_t entry, uintptr_t user_sp, size_t bin
 
     portENTER_CRITICAL(&s_sandbox_lock);
     if (s_active_sandboxes == 0) {
-        uintptr_t vec_table = (((uintptr_t)sandbox_vector_table) & ~0xFFUL) | 0x01;
-        asm volatile ("csrrw %0, mtvec, %1" : "=r"(g_saved_mtvec) : "r"(vec_table));
-        asm volatile ("csrr %0, mie" : "=r"(g_saved_mie));
-        asm volatile ("csrr %0, mscratch" : "=r"(g_saved_mscratch));
-        sandbox_wdt_disable();
+        g_saved_mtvec = hal_cpu_swap_mtvec_vectored((uintptr_t)sandbox_vector_table);
+        g_saved_mie = hal_cpu_read_mie();
+        g_saved_mscratch = hal_cpu_read_mscratch();
+        hal_wdt_timg_save_and_disable();
         s_sandbox_active = true;
     }
     s_active_sandboxes++;
     portEXIT_CRITICAL(&s_sandbox_lock);
 
-    uint32_t mstatus_val;
-    asm volatile ("csrr %0, mstatus" : "=r"(mstatus_val));
-    mstatus_val &= ~(3UL << 11);
-    mstatus_val |= (1UL << 7);
-    asm volatile ("csrw mstatus, %0" : : "r"(mstatus_val));
-
     /* DEDICATED PER-TASK TRAP STACK */
     uintptr_t kernel_trap_sp = (uintptr_t)&st->trap_stack[SANDBOX_STACK_SIZE];
-
-    asm volatile (
-        "csrw 0x340, %3\n"
-        "csrw 0x341, %0\n"
-        "mv sp, %1\n"
-        "mv a0, %2\n"
-        "fence.i\n"
-        "mret\n"
-        : : "r"(entry), "r"(user_sp), "r"(abi_ptr), "r"(kernel_trap_sp)
-        : "memory"
-    );
+    hal_cpu_enter_umode(entry, user_sp, abi_ptr, kernel_trap_sp);
 
     return SANDBOX_STATUS_OK;
 }

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #define FLASH_SECTOR_SIZE 4096
 #define FLASH_SIZE   (1024 * 1024)
@@ -11,6 +12,8 @@ void flash_read(uint32_t addr, uint8_t *buf, size_t size);
 void flash_write(uint32_t addr, const uint8_t *buf, size_t size);
 void flash_erase_sector(uint32_t sector_num);
 void hal_flash_init(void);
+bool hal_flash_is_ready(void);
 uint32_t hal_flash_get_size(void);
+uint32_t hal_flash_get_chip_size(void);
 
 #endif

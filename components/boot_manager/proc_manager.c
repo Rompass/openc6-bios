@@ -2,12 +2,14 @@
 #include <string.h>
 #include <stdlib.h>
 #include "esp_log.h"
-#include "esp_timer.h"
+#include "hal_timer.h"
+#include "hal_clock.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "proc_manager.h"
+#include "management_engine.h"
 #include "sandbox.h"
 #include "openc6_fs.h"
 #include "hw_usb.h"
@@ -547,7 +549,7 @@ esp_err_t proc_spawn_mem(const char *path, uint16_t current_dir, bool background
     proc->mem_base = (uintptr_t)slot_base;
     proc->mem_size = alloc_size;
     proc->bin_size = exec_bin_size;
-    proc->start_time_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    proc->start_time_ms = hal_timer_get_ms();
     proc->state = background ? PROC_STATE_RUNNING_BG : PROC_STATE_RUNNING_FG;
 
     if (!background) {
@@ -924,7 +926,7 @@ void proc_print_top(void)
     hw_usb_print("===================================================================================\r\n");
 
     /* Print kernel shell reference entry */
-    uint32_t uptime_sec = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+    uint32_t uptime_sec = hal_timer_get_ms() / 1000U;
     char row_kernel[128];
     snprintf(row_kernel, sizeof(row_kernel), " %-4u | %-18s | %-11s | %-10s | %-10s | %lu\r\n",
              0, "kernel/shell", s_fg_pid == 0 ? "FOREGROUND" : "BACKGROUND", "KERNEL", "-", (unsigned long)uptime_sec);
@@ -945,7 +947,7 @@ void proc_print_top(void)
                 default: break;
             }
 
-            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+            uint32_t now_ms = hal_timer_get_ms();
             uint32_t runtime_sec = (now_ms >= s_procs[i].start_time_ms) ?
             (now_ms - s_procs[i].start_time_ms) / 1000U : 0U;
 
@@ -966,6 +968,9 @@ void proc_print_top(void)
     proc_mem_stats_t mem_st;
     proc_get_mem_stats(&mem_st);
 
+    uint32_t active_mhz = management_engine_is_active() ? ulp_me_target_freq : hal_clock_get_cpu_mhz();
+    uint32_t cpu_load   = management_engine_is_active() ? ulp_me_cpu_load : 0;
+
     char footer[320];
     snprintf(footer, sizeof(footer),
              "===================================================================================\r\n"
@@ -975,8 +980,8 @@ void proc_print_top(void)
              mem_st.free_bytes / 1024,
              mem_st.total_bytes / 1024,
              mem_st.largest_free_block / 1024,
-             (unsigned long)ulp_me_cpu_load,
-             (unsigned long)ulp_me_target_freq,
+             (unsigned long)cpu_load,
+             (unsigned long)active_mhz,
              heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024);
     hw_usb_print(footer);
 }

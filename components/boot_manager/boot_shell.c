@@ -5,7 +5,8 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "esp_partition.h"
-#include "esp_timer.h"
+#include "hal_clock.h"
+#include "hal_timer.h"
 #include "esp_heap_caps.h"
 
 #include "boot_manager.h"
@@ -92,11 +93,11 @@ static int16_t shell_resolve_path(const char *path, uint16_t current_dir, char *
  * @param out_received_size Pointer to store the verified byte count received.
  * @return true on successful stream completion, false on timeout or size mismatch.
  */
-static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *out_received_size)
+static bool shell_serial_receive(uint8_t **out_buf, uint32_t *out_received_size)
 {
     uint8_t size_buf[4] = {0};
     uint32_t file_size = 0;
-    uint64_t start_time = esp_timer_get_time();
+    uint64_t start_time = hal_timer_get_us();
     uint64_t last_sync_time = 0;
     int state = 0;
 
@@ -106,9 +107,9 @@ static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *ou
     }
 
     /* Wait for host synchronization preamble (0x5A 0xA5 followed by 4-byte LE size) */
-    while ((esp_timer_get_time() - start_time) < 30000000ULL) {
+    while ((hal_timer_get_us() - start_time) < 30000000ULL) {
         management_engine_pet_watchdog();
-        uint64_t now = esp_timer_get_time();
+        uint64_t now = hal_timer_get_us();
         if (now - last_sync_time > 500000ULL) {
             hw_usb_print("##OPENC6_SYNC##");
             last_sync_time = now;
@@ -141,10 +142,18 @@ static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *ou
     ((uint32_t)size_buf[2] << 16) |
     ((uint32_t)size_buf[3] << 24);
 
-    if (file_size == 0 || file_size > max_size) {
+    if (file_size == 0) {
         hw_usb_putc(CMD_NAK);
         hw_usb_flush();
-        hw_usb_print("\r\n[SERIAL] Error: File size exceeds capacity.\r\n");
+        hw_usb_print("\r\n[SERIAL] Error: Invalid file size.\r\n");
+        return false;
+    }
+
+    uint8_t *rx_buf = (uint8_t *)proc_mempool_alloc((size_t)file_size);
+    if (!rx_buf) {
+        hw_usb_putc(CMD_NAK);
+        hw_usb_flush();
+        hw_usb_print("\r\n[SERIAL] Error: Insufficient free pages in arena.\r\n");
         return false;
     }
 
@@ -153,15 +162,15 @@ static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *ou
 
     uint32_t total_received = 0;
     int chunk_accum = 0;
-    uint64_t last_data_time = esp_timer_get_time();
+    uint64_t last_data_time = hal_timer_get_us();
 
     /* Receive data bytes in 64-byte chunks with flow-control ACKs */
     while (total_received < file_size) {
         management_engine_pet_watchdog();
         if (hw_usb_has_data()) {
-            out_buf[total_received++] = (uint8_t)hw_usb_getc();
+            rx_buf[total_received++] = (uint8_t)hw_usb_getc();
             chunk_accum++;
-            last_data_time = esp_timer_get_time();
+            last_data_time = hal_timer_get_us();
 
             if (chunk_accum >= 64 || total_received == file_size) {
                 hw_usb_putc(CMD_ACK);
@@ -171,7 +180,8 @@ static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *ou
         }
 
         /* Abort if transfer stalls for more than 5 seconds */
-        if ((esp_timer_get_time() - last_data_time) > 5000000ULL) {
+        if ((hal_timer_get_us() - last_data_time) > 5000000ULL) {
+            proc_mempool_free(rx_buf, (size_t)file_size);
             hw_usb_print("\r\n[SERIAL] Error: Transfer timeout.\r\n");
             return false;
         }
@@ -182,14 +192,15 @@ static bool shell_serial_receive(uint8_t *out_buf, size_t max_size, uint32_t *ou
     }
 
     /* Await End-of-Transmission (EOT) marker */
-    uint64_t eot_timeout = esp_timer_get_time();
-    while ((esp_timer_get_time() - eot_timeout) < 1000000ULL) {
+    uint64_t eot_timeout = hal_timer_get_us();
+    while ((hal_timer_get_us() - eot_timeout) < 1000000ULL) {
         if (hw_usb_has_data()) {
             if ((uint8_t)hw_usb_getc() == CMD_EOT) break;
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
+    *out_buf = rx_buf;
     *out_received_size = total_received;
     return true;
 }
@@ -252,6 +263,7 @@ static void shell_cmd_cp_mv(uint16_t current_dir, bool is_move)
 
     uint8_t *buf = NULL;
     bool heap_allocated = false;
+    bool pool_allocated = false;
 
     if (src_size == 0) {
         if (fs_write_file(final_dst_name, (const uint8_t *)"", 0, final_dst_dir) >= 0) {
@@ -264,31 +276,36 @@ static void shell_cmd_cp_mv(uint16_t current_dir, bool is_move)
     }
 
     buf = (uint8_t *)malloc((size_t)src_size);
-    if (!buf) {
-        if (sandbox_get_arena() && (size_t)src_size <= sandbox_get_arena_size()) {
-            buf = sandbox_get_arena();
+    if (buf) {
+        heap_allocated = true;
+    } else {
+        buf = (uint8_t *)proc_mempool_alloc((size_t)src_size);
+        if (buf) {
+            pool_allocated = true;
         } else {
             hw_usb_print("Error: Insufficient memory for copy buffer.\r\n");
             return;
         }
-    } else {
-        heap_allocated = true;
     }
 
     if (fs_read_file(src_id, buf, 0, (uint32_t)src_size) != src_size) {
         hw_usb_print("Error: Failed reading source file.\r\n");
         if (heap_allocated) free(buf);
+        else if (pool_allocated) proc_mempool_free(buf, (size_t)src_size);
         return;
     }
 
     if (fs_write_file(final_dst_name, buf, (uint32_t)src_size, final_dst_dir) < 0) {
         hw_usb_print("Error: Failed writing destination file.\r\n");
         if (heap_allocated) free(buf);
+        else if (pool_allocated) proc_mempool_free(buf, (size_t)src_size);
         return;
     }
 
     if (heap_allocated) {
         free(buf);
+    } else if (pool_allocated) {
+        proc_mempool_free(buf, (size_t)src_size);
     }
 
     if (is_move) {
@@ -413,7 +430,7 @@ void boot_manager_shell(const openc6_abi_t *abi)
             hw_usb_print(out);
         }
         else if (strcmp(cmd, "info") == 0) {
-            uint32_t mhz = get_real_cpu_mhz();
+            uint32_t mhz = hal_clock_get_cpu_mhz();
             int32_t temp = ulp_me_temperature;
             uint32_t busy = ulp_me_hp_busy_ticks;
             uint32_t idle = ulp_me_hp_idle_ticks;
@@ -431,7 +448,7 @@ void boot_manager_shell(const openc6_abi_t *abi)
                      (unsigned long)busy,
                      (unsigned long)idle,
                      (long)temp,
-                     ulp_me_hp_is_awake ? "ACTIVE (WDT LINKED)" : "IDLE");
+                     management_engine_is_active() ? (ulp_me_hp_is_awake ? "ACTIVE (WDT LINKED)" : "IDLE") : "DISABLED");
             hw_usb_print(out);
         }
         else if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "exit") == 0) {
@@ -562,9 +579,12 @@ void boot_manager_shell(const openc6_abi_t *abi)
                      target_file);
             hw_usb_print(info_msg);
 
+            uint8_t *rx_buf = NULL;
             uint32_t received = 0;
-            if (shell_serial_receive(arena, max_sz, &received)) {
-                if (fs_write_file(target_file, arena, received, target_dir) >= 0) {
+            if (shell_serial_receive(&rx_buf, &received)) {
+                int16_t w_res = fs_write_file(target_file, rx_buf, received, target_dir);
+                proc_mempool_free(rx_buf, (size_t)received);
+                if (w_res >= 0) {
                     if (!path_arg || strlen(path_arg) == 0) {
                         hw_usb_print("[SERIAL] Download succeeded! File stored in /downloaded/payload.bin\r\n");
                     } else {

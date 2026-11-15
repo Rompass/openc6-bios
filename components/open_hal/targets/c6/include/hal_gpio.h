@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "hal_board.h"
 
 /*
  * ============================================================================
@@ -23,26 +24,7 @@
 #define C6_IO_MUX_PIN_REG(pin)   ((volatile uint32_t *)(C6_IO_MUX_BASE + 0x0004 + ((pin) * 4)))
 #define C6_IO_MUX_MCU_SEL_GPIO   (1UL << 12) /* Function 1: Direct GPIO Pad Select */
 
-/*
- * Protected Pin Bitmask for ESP32-C6-Zero:
- * - GPIO 1, 2   : Hardware Clear CMOS / NVRAM Factory Reset jumper lines
- * - GPIO 3, 4   : Management Engine LP-Core GND / Sense line & Wakeup
- * - GPIO 8      : Onboard WS2812 Addressable RGB LED (Exclusive to led_mgmt)
- * - GPIO 9      : Physical BOOT Button & Strapping pin
- * - GPIO 12, 13 : USB-Serial-JTAG Native D- / D+ PHY lines
- * - GPIO 24..30 : Internal High-Speed SPI Flash bus
- */
-#define OPENC6_GPIO_PROTECTED_MASK ( \
-(1UL << 1)  | \
-(1UL << 2)  | \
-(1UL << 3)  | \
-(1UL << 4)  | \
-(1UL << 8)  | \
-(1UL << 9)  | \
-(1UL << 12) | \
-(1UL << 13) | \
-(0x7FUL << 24) \
-)
+#define OPENC6_GPIO_PROTECTED_MASK HAL_GPIO_PROTECTED_MASK
 
 /**
  * @brief Checks if a GPIO pin is permissible for unprivileged user operations.
@@ -55,7 +37,7 @@ static inline bool hal_gpio_is_safe(uint32_t pin)
     if (pin > 30) {
         return false;
     }
-    return ((OPENC6_GPIO_PROTECTED_MASK & (1UL << pin)) == 0);
+    return ((HAL_GPIO_PROTECTED_MASK & (1UL << pin)) == 0);
 }
 
 /**

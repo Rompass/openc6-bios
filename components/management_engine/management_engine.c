@@ -1,36 +1,36 @@
 #include "management_engine.h"
 #include "me_shared.h"
-#include "ulp_lp_core.h"
-#include "me_core.h"
+#include "hal_board.h"
 #include "esp_log.h"
-#include "esp_system.h"
-
-extern const uint8_t me_core_bin_start[] asm("_binary_me_core_bin_start");
-extern const uint8_t me_core_bin_end[]   asm("_binary_me_core_bin_end");
 
 static const char *TAG = "ME_HOST";
 static bool me_active = false;
 
-// Verify the value matches a known bootsource enum.
-// Uninitialized LP RAM contains junk on cold boots; validation is required
-// to prevent random RAM garbage from being processed as a valid boot signal.
+#if HAL_CAP_LP_CORE
+
+#include "ulp_lp_core.h"
+#include "me_core.h"
+
+extern const uint8_t me_core_bin_start[] asm("_binary_me_core_bin_start");
+extern const uint8_t me_core_bin_end[]   asm("_binary_me_core_bin_end");
+
 static bool is_valid_boot_reason(uint32_t r) {
     return r == ME_BOOT_REASON_NONE        ||
     r == ME_BOOT_REASON_NORMAL      ||
     r == ME_BOOT_REASON_SETUP       ||
     r == ME_BOOT_REASON_FORCE_RESET ||
-    r == ME_BOOT_REASON_WDT         || // Diagnostic expansion
-    r == ME_BOOT_REASON_THERMAL;       // Diagnostic expansion
+    r == ME_BOOT_REASON_WDT         ||
+    r == ME_BOOT_REASON_THERMAL;
 }
 
 void management_engine_init(bool is_enabled, bool is_cold_boot) {
     if (!is_enabled) {
-        ESP_LOGW(TAG, "Management Engine is DISABLED. System running in Legacy Mode.");
+        me_active = false;
+        ESP_LOGW(TAG, "Management Engine is DISABLED. Running without LP-Core, Thermal Guard & SchedUtil.");
         return;
     }
 
     if (!is_cold_boot) {
-        // Warm wakeup path: LP core is already running, LP RAM is intact. Skip re-deployment.
         ESP_LOGI(TAG, "ME already running (wakeup path). Skipping LP-Core re-deploy.");
         me_active = true;
         return;
@@ -42,11 +42,10 @@ void management_engine_init(bool is_enabled, bool is_cold_boot) {
                                             (me_core_bin_end - me_core_bin_start));
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to load ME binary: %s", esp_err_to_name(err));
+        me_active = false;
         return;
     }
 
-    // Initialize LP RAM parameters strictly after binary deployment.
-    // Note: get_boot_reason() has already fetched values prior to this step.
     ulp_me_is_enabled  = 1;
     ulp_me_boot_reason = ME_BOOT_REASON_NONE;
 
@@ -57,12 +56,6 @@ void management_engine_init(bool is_enabled, bool is_cold_boot) {
     ESP_LOGI(TAG, "ME is Active. Hardware WDT & Button logic delegated to LP-Core.");
 }
 
-bool management_engine_check_force_shutdown(void) {
-    return false; // Watchdog reset is processed via me_reason inside bios_core_start
-}
-
-// MUST be called before management_engine_init().
-// On cold boots, LP RAM is uninitialized. Default to NONE if garbage is detected.
 uint32_t management_engine_get_boot_reason(void) {
     uint32_t r = ulp_me_boot_reason;
     if (!is_valid_boot_reason(r)) {
@@ -76,9 +69,47 @@ void management_engine_clear_boot_reason(void) {
     ulp_me_boot_reason = ME_BOOT_REASON_NONE;
 }
 
-// HP Core triggers this every ~2s to announce stable kernel execution.
-// LP Core enforces a 15-second timeout (ME_WDT_TIMEOUT_MS) before hardware reset.
 void management_engine_pet_watchdog(void) {
     if (!me_active) return;
     ulp_me_wdt_counter++;
+}
+
+#else /* HAL_CAP_LP_CORE == 0 (Target without LP-Core hardware) */
+
+/* Fallback shared symbols so shell/web_ui link cleanly without ULP binary */
+uint32_t ulp_me_hp_is_awake   = 0;
+uint32_t ulp_me_boot_reason   = ME_BOOT_REASON_NONE;
+uint32_t ulp_me_wdt_counter   = 0;
+uint32_t ulp_me_hp_busy_ticks = 0;
+uint32_t ulp_me_hp_idle_ticks = 0;
+uint32_t ulp_me_cpu_load      = 0;
+uint32_t ulp_me_max_freq      = 0;
+uint32_t ulp_me_min_freq      = 0;
+uint32_t ulp_me_target_freq   = 0;
+uint32_t ulp_me_temperature   = 0;
+uint32_t ulp_me_throttle_temp = 0;
+uint32_t ulp_me_emergency_temp= 0;
+
+void management_engine_init(bool is_enabled, bool is_cold_boot) {
+    (void)is_enabled;
+    (void)is_cold_boot;
+    me_active = false;
+    ESP_LOGW(TAG, "No hardware LP-Core on this target. ME, Thermal Guard & SchedUtil disabled.");
+}
+
+uint32_t management_engine_get_boot_reason(void) {
+    return ME_BOOT_REASON_NONE;
+}
+
+void management_engine_clear_boot_reason(void) {}
+void management_engine_pet_watchdog(void) {}
+
+#endif /* HAL_CAP_LP_CORE */
+
+bool management_engine_is_active(void) {
+    return me_active;
+}
+
+bool management_engine_check_force_shutdown(void) {
+    return false;
 }

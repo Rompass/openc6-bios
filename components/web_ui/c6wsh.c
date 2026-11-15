@@ -23,6 +23,7 @@
 #include "nvram.h"
 #include "management_engine.h"
 #include "me_shared.h"
+#include "hal_clock.h"
 
 static const char *TAG = "C6WSH";
 
@@ -281,6 +282,7 @@ static void c6wsh_cmd_cp_mv(char *saveptr, bool is_move)
 
     uint8_t *buf = NULL;
     bool heap_allocated = false;
+    bool pool_allocated = false;
 
     if (src_size == 0) {
         if (fs_write_file(final_dst_name, (const uint8_t *)"", 0, final_dst_dir) >= 0) {
@@ -293,31 +295,36 @@ static void c6wsh_cmd_cp_mv(char *saveptr, bool is_move)
     }
 
     buf = (uint8_t *)malloc((size_t)src_size);
-    if (!buf) {
-        if (sandbox_get_arena() && (size_t)src_size <= sandbox_get_arena_size()) {
-            buf = sandbox_get_arena();
+    if (buf) {
+        heap_allocated = true;
+    } else {
+        buf = (uint8_t *)proc_mempool_alloc((size_t)src_size);
+        if (buf) {
+            pool_allocated = true;
         } else {
             c6wsh_print("Error: Insufficient memory for copy buffer.\r\n");
             return;
         }
-    } else {
-        heap_allocated = true;
     }
 
     if (fs_read_file(src_id, buf, 0, (uint32_t)src_size) != src_size) {
         c6wsh_print("Error: Failed reading source file.\r\n");
         if (heap_allocated) free(buf);
+        else if (pool_allocated) proc_mempool_free(buf, (size_t)src_size);
         return;
     }
 
     if (fs_write_file(final_dst_name, buf, (uint32_t)src_size, final_dst_dir) < 0) {
         c6wsh_print("Error: Failed writing destination file.\r\n");
         if (heap_allocated) free(buf);
+        else if (pool_allocated) proc_mempool_free(buf, (size_t)src_size);
         return;
     }
 
     if (heap_allocated) {
         free(buf);
+    } else if (pool_allocated) {
+        proc_mempool_free(buf, (size_t)src_size);
     }
 
     if (is_move) {
@@ -401,8 +408,7 @@ void c6wsh_execute_command(const char *cmd_line)
                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT) / 1024);
         c6wsh_print(out);
     } else if (strcmp(cmd, "info") == 0) {
-        /* Read true physical CPU clock directly from silicon PCR register (0x60096118) */
-        uint32_t mhz = get_real_cpu_mhz();
+        uint32_t mhz = hal_clock_get_cpu_mhz();
         int32_t temp = ulp_me_temperature;
         uint32_t busy = ulp_me_hp_busy_ticks;
         uint32_t idle = ulp_me_hp_idle_ticks;
@@ -420,7 +426,7 @@ void c6wsh_execute_command(const char *cmd_line)
                  (unsigned long)busy,
                  (unsigned long)idle,
                  (long)temp,
-                 ulp_me_hp_is_awake ? "ACTIVE (WDT LINKED)" : "IDLE");
+                 management_engine_is_active() ? (ulp_me_hp_is_awake ? "ACTIVE (WDT LINKED)" : "IDLE") : "DISABLED");
         c6wsh_print(out);
     } else if (strcmp(cmd, "poweroff") == 0 || strcmp(cmd, "exit") == 0) {
         c6wsh_print("Entering S5 Soft-Off state (Powering down)...\r\n");

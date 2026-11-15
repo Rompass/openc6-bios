@@ -41,12 +41,6 @@ typedef void (*hw_usb_tap_fn_t)(const uint8_t *data, size_t len);
 extern volatile hw_usb_tap_fn_t g_hw_usb_tap;
 
 /**
- * @brief Forward declaration of Management Engine watchdog feeding routine.
- * Allows bare-metal USB drivers to service the LP-Core heartbeat during long FIFO stalls.
- */
-void management_engine_pet_watchdog(void);
-
-/**
  * @brief Attaches or detaches an active console telemetry streaming hook.
  *
  * @param tap Destination callback receiving byte duplicates, or NULL to disarm.
@@ -124,7 +118,7 @@ static inline char hw_usb_getc(void)
 
 /**
  * @brief Transmits a null-terminated string over native USB-Serial-JTAG.
- * Segments into 64-byte packets and pets LP watchdog during FIFO wait loops.
+ * Segments into 64-byte packets.
  * Dispatches to telemetry tap outside FIFO spinlock to eliminate lock inversion deadlocks.
  *
  * @param str Null-terminated ASCII string.

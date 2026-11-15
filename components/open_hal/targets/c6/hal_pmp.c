@@ -1,5 +1,4 @@
-#include "sandbox.h"
-#include "hw_usb.h"
+#include "hal_pmp.h"
 #include "soc/soc.h"
 
 /* RISC-V Privileged Architecture v1.12: PMP CSRs on RV32
@@ -15,7 +14,7 @@
 #define PMP_X         (1UL << 2)
 #define PMP_A_TOR     (1UL << 3)
 
-void sandbox_pmp_setup(uintptr_t arena_start, uintptr_t arena_end)
+void hal_pmp_setup(uintptr_t arena_start, uintptr_t arena_end)
 {
     if (arena_start == 0 && arena_end == 0) {
         asm volatile (

@@ -2,6 +2,7 @@
 #include "esp_partition.h"
 #include "esp_log.h"
 #include "hw_usb.h"
+#include "esp_flash.h"
 
 static const esp_partition_t *s_fs_partition = NULL;
 static const char *TAG = "HAL_FLASH";
@@ -66,4 +67,16 @@ void flash_erase_sector(uint32_t sector_num) {
  */
 uint32_t hal_flash_get_size(void) {
     return s_fs_partition ? s_fs_partition->size : FLASH_SIZE;
+}
+
+bool hal_flash_is_ready(void) {
+    return s_fs_partition != NULL;
+}
+
+uint32_t hal_flash_get_chip_size(void) {
+    uint32_t flash_sz = 0;
+    if (esp_flash_get_size(NULL, &flash_sz) == ESP_OK) {
+        return flash_sz;
+    }
+    return 0;
 }

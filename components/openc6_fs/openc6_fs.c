@@ -12,6 +12,7 @@
 #include "esp_wifi.h"
 #include "wifi_mgmt.h"
 #include "me_shared.h"
+#include "management_engine.h"
 
 #define MAX_FILES_LIMIT 1024
 #define FS_MAGIC_SKIP 0xEEEE

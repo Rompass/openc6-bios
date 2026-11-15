@@ -9,7 +9,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_timer.h"
+#include "hal_timer.h"
 #include "wifi_mgmt.h"
 #include "nvram.h"
 #include "management_engine.h"
