@@ -151,6 +151,9 @@ static inline __attribute__((always_inline)) void hal_cpu_set_mret_mode(bool to_
 static inline __attribute__((always_inline)) void hal_cpu_enter_umode(
     uintptr_t entry, uintptr_t user_sp, uintptr_t arg0, uintptr_t kernel_trap_sp)
 {
+    /* Keep interrupts masked while configuring MPP=0 and per-task mscratch; mret re-enables via MPIE */
+    asm volatile ("csrci mstatus, 8" ::: "memory");
+
     uint32_t mstatus_val;
     asm volatile ("csrr %0, mstatus" : "=r"(mstatus_val));
     mstatus_val &= ~(3UL << 11);

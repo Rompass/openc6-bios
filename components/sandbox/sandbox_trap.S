@@ -99,9 +99,11 @@ sandbox_intr_trampoline:
     /* ------------------------------------------------------------------------
      * Interrupted from User Mode (U-Mode, MPP == 0)
      * ------------------------------------------------------------------------ */
-    /* Preserve original U-mode execution PC inside trampoline frame */
+    /* Preserve original U-mode execution PC and per-task mscratch inside trampoline frame */
     csrr t0, mepc
     sw   t0, 8(sp)
+    csrr t0, 0x340
+    sw   t0, 12(sp)
 
     /* Divert mepc to the U-mode return trampoline so FreeRTOS returns there */
     la   t0, sandbox_umode_return_trampoline
@@ -149,6 +151,10 @@ sandbox_umode_return_trampoline:
     /* Save scratch registers in trampoline frame to safely manipulate CSRs */
     sw   t0, 0(sp)
     sw   t1, 4(sp)
+
+    /* Restore this task's kernel trap stack into mscratch */
+    lw   t0, 12(sp)
+    csrw 0x340, t0
 
     /* Restore original U-mode execution PC from frame */
     lw   t0, 8(sp)
